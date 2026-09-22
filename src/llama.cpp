@@ -10438,6 +10438,7 @@ static bool dsv4_stream_offset_size(const struct ggml_tensor * tensor, uint32_t 
 
 // TODO: replace all non-fatal assertions with returned errors or exceptions
 struct llama_data_write {
+    virtual void tensor_boundary() {}
     virtual void write(const void * src, size_t size) = 0;
     virtual void write_tensor_data(const struct ggml_tensor * tensor, size_t offset, size_t size, int il) = 0;
     virtual size_t get_size_written() = 0;
@@ -10698,6 +10699,7 @@ struct llama_data_write {
                     const size_t live = kv_self.live_swa();
                     if (live) {
                         for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                            tensor_boundary();
                             const size_t src_offset = (kv_self.sink_rows + (size_t) j * kv_size) * v_size_el;
                             write_tensor_data(kv_self.v_l[il], src_offset, live * v_size_el, il);
                         }
@@ -10707,6 +10709,7 @@ struct llama_data_write {
 
                 // For each row, we get the element values of each cell
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                    tensor_boundary();
                     // Read each range of cells of v_size_el length each into tmp_buf and write out
                     for (const auto & range : cell_ranges) {
                         const size_t range_size = range.second - range.first;
@@ -11786,6 +11789,10 @@ struct llama_data_write_dummy : llama_data_write {
 };
 
 struct llama_data_write_buffer : llama_data_write {
+    void (*boundary)(size_t, void *) = nullptr;
+    void * boundary_data = nullptr;
+    const ggml_tensor * last_tensor = nullptr;
+    void tensor_boundary() override { last_tensor = nullptr; }
     uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_written = 0;
@@ -11797,6 +11804,8 @@ struct llama_data_write_buffer : llama_data_write {
     llama_data_write_buffer(uint8_t * p, size_t len, const llama_model & _model) : ptr(p), buf_size(len), model(_model) {}
 
     void write(const void * src, size_t size) override {
+        if (last_tensor && boundary) { boundary(size_written, boundary_data); }
+        last_tensor = nullptr;
         if (size > buf_size) {
             throw std::runtime_error("unexpectedly reached end of buffer");
         }
@@ -11807,6 +11816,8 @@ struct llama_data_write_buffer : llama_data_write {
     }
 
     void write_tensor_data(const struct ggml_tensor * tensor, size_t offset, size_t size, int il) override {
+        if (last_tensor != tensor && boundary) { boundary(size_written, boundary_data); }
+        last_tensor = tensor;
         if (size > buf_size) {
             throw std::runtime_error("unexpectedly reached end of buffer");
         }
@@ -12235,7 +12246,14 @@ size_t llama_state_seq_get_size(struct llama_context * ctx, llama_seq_id seq_id,
 }
 
 size_t llama_state_seq_get_data(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    return llama_state_seq_get_data_ext(ctx, dst, size, seq_id, flags, nullptr, nullptr);
+}
+
+size_t llama_state_seq_get_data_ext(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id,
+        llama_state_seq_flags flags, void (*boundary)(size_t, void *), void * user_data) {
     llama_data_write_buffer data_ctx(dst, size, ctx->model);
+    data_ctx.boundary = boundary;
+    data_ctx.boundary_data = user_data;
     try {
         return llama_state_seq_get_data_internal(ctx, data_ctx, seq_id, flags);
     } catch (const std::exception & err) {

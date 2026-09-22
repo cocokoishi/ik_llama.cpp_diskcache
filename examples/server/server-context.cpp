@@ -24,6 +24,13 @@
 #include <exception>
 #include <set>
 #include <system_error>
+#include <tuple>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 // DFlash/DSpark (draft model family) and MTP stages work with multimodal
 static bool server_speculative_multimodal_supported(const common_params_speculative & params) {
@@ -582,7 +589,15 @@ void server_slot::prompt_save(server_prompt_cache& prompt_cache) const {
         return;
     }
 
-    llama_state_seq_get_data(ctx, cur->data.data(), cur_size, id, 0);
+    cur->state_boundaries.clear();
+    const size_t written = llama_state_seq_get_data_ext(ctx, cur->data.data(), cur_size, id, 0,
+        [](size_t offset, void * user) {
+            auto & ends = *static_cast<std::vector<size_t> *>(user);
+            if (ends.empty() || ends.back() != offset) { ends.push_back(offset); }
+        }, &cur->state_boundaries);
+    if (written != cur_size) {
+        prompt_cache.states.remove_if([cur](const server_prompt & item) { return &item == cur; });
+    }
 }
 
 bool server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, float min_reusable_fraction) {
@@ -849,9 +864,8 @@ server_disk_kv_cache::~server_disk_kv_cache() {
         io_thread_.join();
     }
 
-    // The writer has finished all queued snapshots.  Fold successful writes
-    // into the in-memory index once more so quota enforcement also applies
-    // during orderly shutdown.
+    // The writer has published all queued snapshots. Finish deferred cleanup
+    // and quota enforcement once more during orderly shutdown.
     drain_completed_saves();
     evict_if_needed();
 }
@@ -1345,6 +1359,328 @@ bool server_disk_kv_cache::write_checkpoint_file(
     return true;
 }
 
+namespace {
+constexpr char disk_state_magic[] = "KVEXT001";
+constexpr size_t disk_state_extent_max = 64 * 1024;
+uint64_t disk_state_hash(const uint8_t * data, size_t size) {
+    uint64_t h = 14695981039346656037ull ^ size;
+    size_t i = 0;
+    for (; size - i >= sizeof(uint64_t); i += sizeof(uint64_t)) {
+        uint64_t word;
+        std::memcpy(&word, data + i, sizeof(word));
+        h = (h ^ word) * 1099511628211ull;
+        h ^= h >> 32;
+    }
+    for (; i < size; ++i) { h = (h ^ data[i]) * 1099511628211ull; }
+    return h;
+}
+bool disk_state_replace(const std::filesystem::path & from, const std::filesystem::path & to) {
+#ifdef _WIN32
+    return MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    std::error_code ec;
+    std::filesystem::rename(from, to, ec);
+    return !ec;
+#endif
+}
+}
+
+bool server_disk_kv_cache::read_state_index(entry & value) const {
+    value.state_extents.clear();
+    value.state_size = 0;
+    std::ifstream file(value.state_path, std::ios::binary);
+    char magic[8];
+    if (!file.read(magic, sizeof(magic))) { return false; }
+    if (std::memcmp(magic, disk_state_magic, sizeof(magic)) != 0) { return true; }
+    uint64_t count = 0, total = 0;
+    file.read(reinterpret_cast<char *>(&total), sizeof(total));
+    file.read(reinterpret_cast<char *>(&count), sizeof(count));
+    std::error_code ec;
+    const auto bytes = std::filesystem::file_size(value.state_path, ec);
+    if (!file || ec || total == 0 || total > SIZE_MAX || count == 0 || count > bytes / 49) { return false; }
+    uint64_t sum = 0;
+    std::map<std::string, uintmax_t> pack_sizes;
+    for (uint64_t i = 0; i < count; ++i) {
+        state_extent extent;
+        uint32_t len = 0;
+        file.read(reinterpret_cast<char *>(&len), sizeof(len));
+        if (!file || len == 0 || len > 256) { return false; }
+        extent.pack.resize(len);
+        file.read(&extent.pack[0], len);
+        file.read(reinterpret_cast<char *>(&extent.offset), sizeof(extent.offset));
+        file.read(reinterpret_cast<char *>(&extent.size), sizeof(extent.size));
+        file.read(reinterpret_cast<char *>(&extent.hash), sizeof(extent.hash));
+        file.read(reinterpret_cast<char *>(&extent.stream), sizeof(extent.stream));
+        file.read(reinterpret_cast<char *>(&extent.position), sizeof(extent.position));
+        if (!file || extent.pack.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") != std::string::npos ||
+            extent.pack.size() < 8 || extent.pack.substr(extent.pack.size() - 7) != ".kvpack" ||
+            extent.size == 0 || extent.size > disk_state_extent_max || extent.size > total - sum) { return false; }
+        auto pack = pack_sizes.find(extent.pack);
+        if (pack == pack_sizes.end()) {
+            const auto size = std::filesystem::file_size(namespace_path_ / extent.pack, ec);
+            if (ec) { return false; }
+            pack = pack_sizes.emplace(extent.pack, size).first;
+        }
+        const auto pack_size = pack->second;
+        if (ec || extent.offset > pack_size || extent.size > pack_size - extent.offset) { return false; }
+        sum += extent.size;
+        value.state_extents.push_back(std::move(extent));
+    }
+    if (sum != total || file.peek() != std::char_traits<char>::eof()) { return false; }
+    value.state_size = total;
+    return true;
+}
+
+bool server_disk_kv_cache::read_state(const entry & value, std::vector<uint8_t> & data) const {
+    if (!value.state_size) {
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(value.state_path, ec);
+        if (ec || !size || size > SIZE_MAX) { return false; }
+        data.resize((size_t) size);
+        std::ifstream file(value.state_path, std::ios::binary);
+        return bool(file.read(reinterpret_cast<char *>(data.data()), data.size()));
+    }
+    data.resize((size_t) value.state_size);
+    // Open each immutable pack once; manifests contain direct slices, never
+    // chains of parent states. Evicting a parent cannot invalidate a child.
+    std::map<std::string, std::ifstream> packs;
+    size_t output = 0;
+    for (size_t i = 0; i < value.state_extents.size();) {
+        const auto & extent = value.state_extents[i];
+        auto & file = packs[extent.pack];
+        if (!file.is_open()) { file.open(namespace_path_ / extent.pack, std::ios::binary); }
+        size_t end = i + 1;
+        uint64_t size = extent.size;
+        while (end < value.state_extents.size() && value.state_extents[end].pack == extent.pack &&
+               value.state_extents[end].offset == extent.offset + size) {
+            size += value.state_extents[end++].size;
+        }
+        file.seekg((std::streamoff) extent.offset);
+        if (!file.read(reinterpret_cast<char *>(data.data() + output), size)) { return false; }
+        for (; i < end; ++i) {
+            const auto & part = value.state_extents[i];
+            if (disk_state_hash(data.data() + output, part.size) != part.hash) { return false; }
+            output += (size_t) part.size;
+        }
+    }
+    return output == data.size();
+}
+
+bool server_disk_kv_cache::write_state(const std::filesystem::path & path, const pending_save & pending, entry & value) {
+    // The serializer supplies logical tensor boundaries, independent of cell
+    // fragmentation and sequence length. In particular, each transposed V row
+    // starts a new stream. Never interpret a token count as a byte offset.
+    // A short branch can reference a slice of an existing longer extent: the
+    // common prefix is not copied even when divergence falls inside a block.
+    std::map<std::pair<uint64_t, uint64_t>, std::vector<state_extent>> prefixes;
+    std::map<std::string, std::ifstream> packs;
+    std::set<std::tuple<std::string, uint64_t, uint64_t>> seen;
+    std::vector<uint8_t> scratch(disk_state_extent_max);
+    const auto read_extent = [&](const state_extent & extent) {
+        auto & file = packs[extent.pack];
+        if (!file.is_open()) { file.open(namespace_path_ / extent.pack, std::ios::binary); }
+        file.clear();
+        file.seekg((std::streamoff) extent.offset);
+        return bool(file.read(reinterpret_cast<char *>(scratch.data()), extent.size)) &&
+            disk_state_hash(scratch.data(), extent.size) == extent.hash;
+    };
+    std::error_code ec;
+    for (const auto & item : std::filesystem::directory_iterator(namespace_path_)) {
+        if (item.path().extension() != ".state") { continue; }
+        entry old;
+        old.state_path = item.path();
+        if (!read_state_index(old)) { continue; }
+        for (const auto & extent : old.state_extents) {
+            if (!seen.emplace(extent.pack, extent.offset, extent.size).second) { continue; }
+            prefixes[{extent.stream, extent.position}].push_back(extent);
+        }
+    }
+    std::string pack_name;
+    for (uint64_t attempt = 0;; ++attempt) {
+        pack_name = value.stem + "-" + std::to_string(now_ticks()) + "-" + std::to_string(attempt) + ".kvpack";
+        if (!std::filesystem::exists(namespace_path_ / pack_name)) { break; }
+    }
+    const auto pack_path = namespace_path_ / pack_name;
+    const auto pack_tmp = namespace_path_ / (pack_name + ".tmp");
+    std::ofstream pack(pack_tmp, std::ios::binary | std::ios::trunc);
+    if (!pack) { return false; }
+    uint64_t pack_offset = 0;
+    value.state_extents.clear();
+    auto boundaries = pending.state_boundaries;
+    boundaries.push_back(0);
+    boundaries.push_back(pending.state.size());
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+    if (boundaries.back() != pending.state.size()) { return false; }
+    for (size_t segment = 1; segment < boundaries.size(); ++segment) {
+        for (size_t pos = boundaries[segment - 1]; pos < boundaries[segment];) {
+            const size_t size = std::min(disk_state_extent_max, boundaries[segment] - pos);
+            state_extent best;
+            size_t matched = 0;
+            {
+                auto found = prefixes.find({segment - 1, pos - boundaries[segment - 1]});
+                if (found != prefixes.end()) {
+                    for (const auto & extent : found->second) {
+                        if (extent.size <= matched || !read_extent(extent)) { continue; }
+                        size_t n = 0;
+                        while (n < std::min(size, (size_t) extent.size) && scratch[n] == pending.state[pos + n]) { ++n; }
+                        if (n > matched) { matched = n; best = extent; }
+                        if (matched == size) { break; }
+                    }
+                }
+            }
+            if (matched) {
+                best.size = matched;
+                best.hash = disk_state_hash(pending.state.data() + pos, matched);
+            } else {
+                matched = size;
+                best.pack = pack_name;
+                best.offset = pack_offset;
+                best.size = matched;
+                best.hash = disk_state_hash(pending.state.data() + pos, matched);
+                pack.write(reinterpret_cast<const char *>(pending.state.data() + pos), matched);
+                pack_offset += matched;
+            }
+            best.stream = segment - 1;
+            best.position = pos - boundaries[segment - 1];
+            value.state_extents.push_back(std::move(best));
+            pos += matched;
+        }
+    }
+    pack.flush();
+    const bool good = pack.good();
+    pack.close();
+    if (!good) { std::filesystem::remove(pack_tmp, ec); return false; }
+    if (pack_offset) {
+        std::filesystem::rename(pack_tmp, pack_path, ec);
+        if (ec) { std::filesystem::remove(pack_tmp, ec); return false; }
+    } else { std::filesystem::remove(pack_tmp, ec); }
+    value.state_size = pending.state.size();
+    return write_state_index(path, value);
+}
+
+bool server_disk_kv_cache::write_state_index(const std::filesystem::path & path, const entry & value) const {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write(disk_state_magic, 8);
+    file.write(reinterpret_cast<const char *>(&value.state_size), sizeof(uint64_t));
+    const uint64_t count = value.state_extents.size();
+    file.write(reinterpret_cast<const char *>(&count), sizeof(count));
+    for (const auto & extent : value.state_extents) {
+        const uint32_t len = (uint32_t) extent.pack.size();
+        file.write(reinterpret_cast<const char *>(&len), sizeof(len));
+        file.write(extent.pack.data(), len);
+        file.write(reinterpret_cast<const char *>(&extent.offset), sizeof(extent.offset));
+        file.write(reinterpret_cast<const char *>(&extent.size), sizeof(extent.size));
+        file.write(reinterpret_cast<const char *>(&extent.hash), sizeof(extent.hash));
+        file.write(reinterpret_cast<const char *>(&extent.stream), sizeof(extent.stream));
+        file.write(reinterpret_cast<const char *>(&extent.position), sizeof(extent.position));
+    }
+    file.flush();
+    return file.good();
+}
+
+void server_disk_kv_cache::compact_state_packs(std::unique_lock<std::mutex> & fs_lock) {
+    std::unique_lock<std::recursive_mutex> writer_guard(writer_gc_mutex_, std::try_to_lock);
+    if (!writer_guard.owns_lock()) { return; }
+    // Called with fs_mutex_. Queued snapshots contain bytes, not pack
+    // references. Defer only for published saves awaiting installation.
+    {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        if (!completed_saves_.empty()) { return; }
+    }
+    using interval = std::pair<uint64_t, uint64_t>;
+    std::map<std::string, std::vector<interval>> live;
+    std::set<std::string> deletion_roots;
+    for (const auto & value : entries_) {
+        for (const auto & extent : value.state_extents) {
+            if (value.gc_only) { deletion_roots.insert(extent.pack); }
+            live[extent.pack].emplace_back(extent.offset, extent.offset + extent.size);
+        }
+    }
+    std::vector<char> buffer(disk_state_extent_max);
+    for (auto & item : live) {
+        if (deletion_roots.count(item.first)) { continue; }
+        auto & ranges = item.second;
+        std::sort(ranges.begin(), ranges.end());
+        std::vector<interval> merged;
+        for (const auto & range : ranges) {
+            if (merged.empty() || range.first > merged.back().second) { merged.push_back(range); }
+            else { merged.back().second = std::max(merged.back().second, range.second); }
+        }
+        uint64_t used = 0;
+        for (const auto & range : merged) { used += range.second - range.first; }
+        std::error_code ec;
+        const auto old_path = namespace_path_ / item.first;
+        const auto old_size = std::filesystem::file_size(old_path, ec);
+        if (ec || used == old_size) { continue; }
+        std::string name;
+        for (uint64_t attempt = 0;; ++attempt) {
+            name = "compact-" + std::to_string(now_ticks()) + "-" + std::to_string(attempt) + ".kvpack";
+            if (!std::filesystem::exists(namespace_path_ / name)) { break; }
+        }
+        const auto tmp = namespace_path_ / (name + ".tmp");
+        // The writer owns pack lifetime, but readers may continue restoring
+        // immutable packs while bulk compaction I/O runs without fs_mutex_.
+        fs_lock.unlock();
+        bool copied = false;
+        try {
+            copied = [&]() {
+                std::ifstream source(old_path, std::ios::binary);
+                std::ofstream target(tmp, std::ios::binary | std::ios::trunc);
+                for (const auto & range : merged) {
+                    source.seekg((std::streamoff) range.first);
+                    for (uint64_t remaining = range.second - range.first; remaining;) {
+                        const size_t n = (size_t) std::min<uint64_t>(remaining, buffer.size());
+                        if (!source.read(buffer.data(), n) || !target.write(buffer.data(), n)) { break; }
+                        remaining -= n;
+                    }
+                    if (!source || !target) { break; }
+                }
+                target.flush();
+                const bool good = source.good() && target.good();
+                target.close();
+                if (!good) { std::filesystem::remove(tmp, ec); return false; }
+                std::filesystem::rename(tmp, namespace_path_ / name, ec);
+                return !ec;
+            }();
+        } catch (...) {
+            fs_lock.lock();
+            throw;
+        }
+        fs_lock.lock();
+        if (!copied) { continue; }
+        // Each manifest replacement is atomic. A crash midway leaves some
+        // entries on the old pack and some on the new; both remain GC roots.
+        for (auto & value : entries_) {
+            entry relocated;
+            relocated.state_size = value.state_size;
+            relocated.state_extents = value.state_extents;
+            bool changed = false;
+            for (auto & extent : relocated.state_extents) {
+                if (extent.pack != item.first) { continue; }
+                uint64_t base = 0;
+                for (const auto & range : merged) {
+                    if (extent.offset >= range.first && extent.offset + extent.size <= range.second) {
+                        extent.offset = base + extent.offset - range.first;
+                        extent.pack = name;
+                        changed = true;
+                        break;
+                    }
+                    base += range.second - range.first;
+                }
+            }
+            if (!changed) { continue; }
+            const auto manifest_tmp = namespace_path_ / (value.stem + ".state.tmp");
+            const auto before = std::filesystem::file_size(value.state_path, ec);
+            if (ec || !write_state_index(manifest_tmp, relocated)) { continue; }
+            const auto after = std::filesystem::file_size(manifest_tmp, ec);
+            if (ec || !disk_state_replace(manifest_tmp, value.state_path)) { continue; }
+            value.state_extents = std::move(relocated.state_extents);
+            value.size_bytes = value.size_bytes - before + after;
+        }
+    }
+}
+
 void server_disk_kv_cache::scan() {
     entries_.clear();
     used_bytes_ = 0;
@@ -1388,7 +1724,8 @@ void server_disk_kv_cache::scan() {
     for (const auto & meta_path : meta_paths) {
         entry value;
         std::error_code state_ec;
-        if (!read_metadata(meta_path, value) || !std::filesystem::is_regular_file(value.state_path, state_ec)) {
+        if (!read_metadata(meta_path, value) || !std::filesystem::is_regular_file(value.state_path, state_ec) ||
+            !read_state_index(value)) {
             report_scan_failure(meta_path, "metadata_or_state", state_ec);
             complete = false;
             continue;
@@ -1472,6 +1809,12 @@ void server_disk_kv_cache::rebuild_usage() {
 
     for (const auto & value : entries_) {
         used_bytes_ += value.size_bytes;
+        for (const auto & extent : value.state_extents) {
+            if (blob_sizes_.count(extent.pack)) { continue; }
+            std::error_code ec;
+            const auto size = std::filesystem::file_size(namespace_path_ / extent.pack, ec);
+            if (!ec) { blob_sizes_.emplace(extent.pack, (uint64_t) size); }
+        }
         for (const auto & checkpoint : value.checkpoints) {
             if (checkpoint.blob_id.empty()) {
                 continue;
@@ -1492,8 +1835,12 @@ void server_disk_kv_cache::rebuild_usage() {
 }
 
 void server_disk_kv_cache::gc_unreferenced_blobs() {
+    std::unique_lock<std::recursive_mutex> writer_guard(writer_gc_mutex_, std::try_to_lock);
+    if (!writer_guard.owns_lock()) { return; }
     std::set<std::string> referenced;
+    std::set<std::string> state_packs;
     for (const auto & value : entries_) {
+        for (const auto & extent : value.state_extents) { state_packs.insert(extent.pack); }
         for (const auto & checkpoint : value.checkpoints) {
             if (!checkpoint.blob_id.empty()) {
                 referenced.insert(checkpoint.blob_id);
@@ -1509,22 +1856,19 @@ void server_disk_kv_cache::gc_unreferenced_blobs() {
         std::lock_guard<std::mutex> lock(io_mutex_);
         io_busy = !pending_saves_.empty() || !active_saves_.empty();
         for (const auto & pending : pending_saves_) {
-            for (const auto & checkpoint : pending.inherited_checkpoints) {
+            for (const auto & checkpoint : pending->inherited_checkpoints) {
                 if (!checkpoint.blob_id.empty()) {
                     referenced.insert(checkpoint.blob_id);
                 }
             }
-            for (const auto & checkpoint : pending.checkpoints) {
-                if (checkpoint.n_tokens > 0 && !checkpoint.data.empty()) {
-                    referenced.insert(checkpoint_blob_id(
-                        checkpoint.pos_min, checkpoint.pos_max, checkpoint.n_tokens, checkpoint.data));
-                }
-            }
+            // New checkpoint bytes are still in RAM; the writer pins GC
+            // before creating their blobs. Only inherited disk refs need roots.
         }
         for (const auto & active : active_saves_) {
             referenced.insert(active.blob_ids.begin(), active.blob_ids.end());
         }
         for (const auto & value : completed_saves_) {
+            for (const auto & extent : value.state_extents) { state_packs.insert(extent.pack); }
             for (const auto & checkpoint : value.checkpoints) {
                 if (!checkpoint.blob_id.empty()) {
                     referenced.insert(checkpoint.blob_id);
@@ -1535,6 +1879,17 @@ void server_disk_kv_cache::gc_unreferenced_blobs() {
 
     std::error_code ec;
     uint64_t removed = 0;
+    // fs_mutex_ serializes publication with collection. Completed handoff
+    // descriptors remain explicit roots until maintenance releases them.
+    for (const auto & item : std::filesystem::directory_iterator(namespace_path_, ec)) {
+        if (ec) { break; }
+        const auto name = item.path().filename().string();
+        if ((item.path().extension() == ".kvpack" && !state_packs.count(name)) ||
+            (!io_busy && name.size() >= 11 && name.substr(name.size() - 11) == ".kvpack.tmp")) {
+            std::filesystem::remove(item.path(), ec);
+            ec.clear();
+        }
+    }
     for (const auto & item : std::filesystem::directory_iterator(blobs_path_, ec)) {
         if (ec) {
             break;
@@ -1572,7 +1927,7 @@ void server_disk_kv_cache::gc_unreferenced_blobs() {
     }
 }
 
-bool server_disk_kv_cache::remove_entry_files(const entry & value) {
+bool server_disk_kv_cache::remove_entry_files(entry & value) {
     const auto remove_one = [](const std::filesystem::path & path) {
         std::error_code ec;
         std::filesystem::remove(path, ec);
@@ -1582,8 +1937,13 @@ bool server_disk_kv_cache::remove_entry_files(const entry & value) {
         ec.clear();
         return !std::filesystem::exists(path, ec) && !ec;
     };
-    const bool state_removed = remove_one(value.state_path);
     const bool meta_removed = remove_one(value.meta_path);
+    // Metadata is the restart-visible root. If it cannot be removed, leave
+    // the complete entry untouched. Otherwise retain an in-memory GC root
+    // until deletion of all remaining files has succeeded.
+    if (!meta_removed) { return false; }
+    value.gc_only = true;
+    const bool state_removed = remove_one(value.state_path);
     const bool checkpoint_removed = remove_one(value.checkpoint_path);
     // Blob lifetime is independent from the entry files.  Leave blobs in
     // place here and let reachability GC remove only those no longer
@@ -1595,10 +1955,29 @@ void server_disk_kv_cache::evict_if_needed(const std::string & keep_stem) {
     if (!scan_complete_) {
         return;
     }
-    std::lock_guard<std::mutex> fs_lock(fs_mutex_);
-    while (used_bytes_ > max_bytes_ && !entries_.empty()) {
+    // Do not evict additional entries merely because a writer pins their
+    // packs. Defer quota maintenance until the completed-save drain.
+    std::unique_lock<std::recursive_mutex> writer_guard(writer_gc_mutex_, std::try_to_lock);
+    if (!writer_guard.owns_lock()) { return; }
+    std::unique_lock<std::mutex> fs_lock(fs_mutex_);
+    if (used_bytes_ > max_bytes_) {
+        compact_state_packs(fs_lock);
+        gc_unreferenced_blobs();
+        rebuild_usage();
+    }
+    std::set<std::string> failed;
+    while (!entries_.empty()) {
         size_t victim = std::numeric_limits<size_t>::max();
+        // Retry tombstones even if another deletion already brought us below
+        // quota; otherwise failed-file GC roots could survive indefinitely.
         for (size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].eviction_failed && !failed.count(entries_[i].stem)) { victim = i; break; }
+        }
+        if (victim == std::numeric_limits<size_t>::max() && used_bytes_ <= max_bytes_) { break; }
+        const bool retry = victim != std::numeric_limits<size_t>::max();
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (retry) { break; }
+            if (failed.count(entries_[i].stem)) { continue; }
             if (!keep_stem.empty() && entries_[i].stem == keep_stem) {
                 continue;
             }
@@ -1609,18 +1988,23 @@ void server_disk_kv_cache::evict_if_needed(const std::string & keep_stem) {
         if (victim == std::numeric_limits<size_t>::max()) {
             // A single entry can be larger than the configured quota.  It is
             // better to remove it than silently exceed the user's limit.
-            victim = 0;
+            for (size_t i = 0; i < entries_.size(); ++i) {
+                if (!failed.count(entries_[i].stem)) { victim = i; break; }
+            }
+            if (victim == std::numeric_limits<size_t>::max()) { break; }
         }
 
         const std::string victim_stem = entries_[victim].stem;
         const uint64_t victim_size = entries_[victim].size_bytes;
         if (!remove_entry_files(entries_[victim])) {
             LLAMA_LOG_WARN("disk KV cache eviction failed; leaving entry on disk\n");
-            entries_.erase(entries_.begin() + victim);
+            entries_[victim].eviction_failed = true;
+            failed.insert(victim_stem);
             continue;
         }
         used_bytes_ = used_bytes_ >= victim_size ? used_bytes_ - victim_size : 0;
         entries_.erase(entries_.begin() + victim);
+        compact_state_packs(fs_lock);
         gc_unreferenced_blobs();
         rebuild_usage();
 
@@ -1634,6 +2018,7 @@ void server_disk_kv_cache::evict_if_needed(const std::string & keep_stem) {
 
 void server_disk_kv_cache::prune_missing_entries() {
     for (size_t i = 0; i < entries_.size();) {
+        if (entries_[i].eviction_failed) { ++i; continue; }
         std::error_code ec;
         const bool state_exists = std::filesystem::is_regular_file(entries_[i].state_path, ec);
         ec.clear();
@@ -1659,6 +2044,7 @@ void server_disk_kv_cache::prune_missing_entries() {
 }
 
 void server_disk_kv_cache::drain_completed_saves() {
+    if (!scan_complete_) { return; } // unknown on-disk roots must never be collected
     std::deque<entry> completed;
     {
         std::lock_guard<std::mutex> lock(io_mutex_);
@@ -1667,61 +2053,33 @@ void server_disk_kv_cache::drain_completed_saves() {
 
     {
         std::lock_guard<std::mutex> fs_lock(fs_mutex_);
-        for (auto & value : completed) {
-            for (size_t i = 0; i < entries_.size(); ++i) {
-                if (entries_[i].stem == value.stem) {
-                    entries_.erase(entries_.begin() + i);
-                    break;
-                }
-            }
-            entries_.push_back(std::move(value));
-        }
-
+        // Publication already installed these descriptors atomically with the
+        // files. Do not overwrite newer LRU touches with the completed copy.
         prune_missing_entries();
         gc_unreferenced_blobs();
         rebuild_usage();
     }
-    if (!completed.empty()) {
+    // Release potentially large snapshot buffers outside the restore lock.
+    const bool had_completed = !completed.empty();
+    completed.clear();
+    if (had_completed || used_bytes_ > max_bytes_ ||
+        std::any_of(entries_.begin(), entries_.end(), [](const entry & value) { return value.eviction_failed; })) {
         evict_if_needed();
     }
 }
 
-bool server_disk_kv_cache::has_matching_pending_save_locked(const server_tokens & requested, float min_reusable_fraction) const {
-    (void) min_reusable_fraction; // RAM similarity is not a disk prefix cutoff.
-    const auto matches = [&](const entry & candidate) {
-        const size_t lcp = common_prefix_tokens(candidate.tokens, requested);
-        return lcp > 0;
-    };
-
-    for (const auto & pending : pending_saves_) {
-        if (matches(pending.value)) {
-            return true;
-        }
-    }
-    for (const auto & active : active_saves_) {
-        entry candidate;
-        candidate.tokens = active.tokens.clone();
-        if (matches(candidate)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool server_disk_kv_cache::wait_for_matching_pending_save(const server_tokens & requested, float min_reusable_fraction) {
-    std::unique_lock<std::mutex> lock(io_mutex_);
-    if (!has_matching_pending_save_locked(requested, min_reusable_fraction)) {
-        return false;
-    }
-
-    io_cv_.wait(lock, [this, &requested, min_reusable_fraction]() {
-        return io_stop_ || !has_matching_pending_save_locked(requested, min_reusable_fraction);
-    });
-    return true;
-}
-
 bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & requested, float min_reusable_fraction, bool has_mtmd) {
-    drain_completed_saves();
+    // Index mutation/publication is atomic with the state-file generation.
+    // Maintenance runs on the writer; requests never perform pack compaction.
+    std::unique_lock<std::mutex> fs_lock(fs_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        if (used_bytes_ > max_bytes_ ||
+            std::any_of(entries_.begin(), entries_.end(), [](const entry & value) { return value.eviction_failed; })) {
+            maintenance_requested_ = true;
+            io_cv_.notify_one();
+        }
+    }
 
     const auto * model = llama_get_model(ctx_);
     // The disk token geometry has no self-extend map. These private-state
@@ -1731,16 +2089,42 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
         return false;
     }
 
-    // A shallow committed match must not hide a better in-flight snapshot.
+    (void) min_reusable_fraction;
+    // Read complete immutable snapshots directly, without waiting for disk I/O.
+    std::vector<std::shared_ptr<const pending_save>> snapshots;
     {
-        const int64_t wait_start = ggml_time_us();
-        if (wait_for_matching_pending_save(requested, min_reusable_fraction)) {
-            drain_completed_saves();
-            LOG_INFO("disk KV cache waited for matching save", {
-                {"wait_ms", (ggml_time_us() - wait_start) / 1000.0},
-            });
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        for (const auto & pending : pending_saves_) { snapshots.push_back(pending); }
+        for (const auto & active : active_saves_) { snapshots.push_back(active.snapshot); }
+        for (const auto & ready : completed_saves_) {
+            if (ready.snapshot && std::find(snapshots.begin(), snapshots.end(), ready.snapshot) == snapshots.end()) {
+                snapshots.push_back(ready.snapshot);
+            }
         }
     }
+    std::vector<entry> candidates;
+    for (const auto & pending : snapshots) {
+        candidates.push_back(pending->value.clone());
+        auto & candidate = candidates.back();
+        candidate.snapshot = pending;
+        candidate.checkpoints.clear();
+        for (size_t i = 0; i < pending->checkpoints.size(); ++i) {
+            const auto & checkpoint = pending->checkpoints[i];
+            entry::checkpoint_index index;
+            index.pos_min = checkpoint.pos_min; index.pos_max = checkpoint.pos_max;
+            index.n_tokens = checkpoint.n_tokens; index.data_size = checkpoint.data.size();
+            index.data_offset = i; // snapshot checkpoint index, not file offset
+            candidate.checkpoints.push_back(std::move(index));
+        }
+        // Match write_checkpoint_file: a newly captured checkpoint wins a
+        // same-position tie against an inherited reference.
+        candidate.checkpoints.insert(candidate.checkpoints.end(),
+            pending->inherited_checkpoints.begin(), pending->inherited_checkpoints.end());
+    }
+    const size_t committed_count = entries_.size();
+    std::vector<entry *> available;
+    for (auto & candidate : entries_) { available.push_back(&candidate); }
+    for (auto & candidate : candidates) { available.push_back(&candidate); }
 
     const size_t current_lcp = common_prefix_tokens(slot.cache_tokens, requested);
     const bool full_state_truncation_safe =
@@ -1761,12 +2145,12 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
     size_t best_checkpoint = std::numeric_limits<size_t>::max();
     bool best_full_truncate = false;
 
-    for (size_t i = 0; i < entries_.size(); ++i) {
-        const entry & candidate = entries_[i];
+    for (size_t i = 0; i < available.size(); ++i) {
+        const entry & candidate = *available[i];
         const size_t lcp = common_prefix_tokens(candidate.tokens, requested);
         // Shifted retained tokens are not the history that produced their KV.
         // The current format cannot prove equivalence with an unshifted request.
-        if (lcp == 0 || candidate.n_discarded_prompt != 0 || candidate.n_kept_prompt < 0) {
+        if (candidate.gc_only || lcp == 0 || candidate.n_discarded_prompt != 0 || candidate.n_kept_prompt < 0) {
             continue;
         }
 
@@ -1855,7 +2239,7 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
         return false;
     }
 
-    entry & candidate = entries_[best];
+    entry & candidate = *available[best];
     const int64_t t_start = ggml_time_us();
     const bool load_full_state = best_checkpoint == std::numeric_limits<size_t>::max();
     const size_t restore_tokens = load_full_state
@@ -1896,27 +2280,18 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
         slot.do_checkpoint = slot.image_just_processed = false;
     };
     try {
-        std::lock_guard<std::mutex> fs_lock(fs_mutex_);
         bool valid = false;
         std::vector<uint8_t> state;
         std::error_code ec;
         // Partial checkpoints omit ordinary attention K/V, so always restore
         // their owning full state first. KEEP_KV overlays checkpoint metadata
         // without relocating the omitted tensor rows.
-        {
-            const uintmax_t state_size = std::filesystem::file_size(candidate.state_path, ec);
-            if (!ec && state_size > 0 && state_size <= std::numeric_limits<size_t>::max()) {
-                state.resize((size_t) state_size);
-                std::ifstream file(candidate.state_path, std::ios::binary);
-                if (file) {
-                    file.read(reinterpret_cast<char *>(state.data()), (std::streamsize) state.size());
-                    valid = file.gcount() == (std::streamsize) state.size();
-                }
-            }
-        }
+        const auto snapshot = candidate.snapshot;
+        valid = snapshot ? !snapshot->state.empty() : read_state(candidate, state);
+        const auto & full_state = snapshot ? snapshot->state : state;
         if (valid) {
             common_speculative_clear_sequence_kv(slot.spec, ctx_, slot.id);
-            valid = llama_state_seq_set_data(ctx_, state.data(), state.size(), slot.id, 0) == state.size();
+            valid = llama_state_seq_set_data(ctx_, full_state.data(), full_state.size(), slot.id, 0) == full_state.size();
             // Check the full geometry BEFORE any suffix deletion. pos_next()
             // describes unshifted token/media positions, not self-extend or a
             // separate server-level system-prefix offset.
@@ -1927,6 +2302,10 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
             valid = false;
             if (!checkpoint.blob_id.empty()) {
                 valid = read_checkpoint_blob(checkpoint, state);
+            }
+            else if (snapshot && checkpoint.data_offset < snapshot->checkpoints.size()) {
+                state = snapshot->checkpoints[checkpoint.data_offset].data;
+                valid = state.size() == checkpoint.data_size;
             }
             else {
                 std::ifstream file(candidate.checkpoint_path, std::ios::binary);
@@ -2016,22 +2395,24 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
         slot.do_checkpoint = slot.image_just_processed = false;
         slot.checkpoint_pos = load_full_state ? -1 : candidate.checkpoints[best_checkpoint].pos_max;
 
-        candidate.last_used = now_ticks();
-        auto meta_tmp = candidate.meta_path;
-        meta_tmp += ".tmp";
-        if (write_metadata(meta_tmp, candidate)) {
-            std::filesystem::remove(candidate.meta_path, ec);
-            ec.clear();
-            std::filesystem::rename(meta_tmp, candidate.meta_path, ec);
-            if (ec) {
+        if (best < committed_count) {
+            candidate.last_used = now_ticks();
+            auto meta_tmp = candidate.meta_path;
+            meta_tmp += ".tmp";
+            if (write_metadata(meta_tmp, candidate)) {
+                std::filesystem::remove(candidate.meta_path, ec);
+                ec.clear();
+                std::filesystem::rename(meta_tmp, candidate.meta_path, ec);
+                if (ec) {
+                    std::filesystem::remove(meta_tmp, ec);
+                }
+            } else {
                 std::filesystem::remove(meta_tmp, ec);
             }
-        } else {
-            std::filesystem::remove(meta_tmp, ec);
-        }
-        std::filesystem::last_write_time(candidate.state_path, std::filesystem::file_time_type::clock::now(), ec);
-        if (!candidate.checkpoints.empty()) {
-            std::filesystem::last_write_time(candidate.checkpoint_path, std::filesystem::file_time_type::clock::now(), ec);
+            std::filesystem::last_write_time(candidate.state_path, std::filesystem::file_time_type::clock::now(), ec);
+            if (!candidate.checkpoints.empty()) {
+                std::filesystem::last_write_time(candidate.checkpoint_path, std::filesystem::file_time_type::clock::now(), ec);
+            }
         }
     } catch (const std::exception & error) {
         LLAMA_LOG_WARN("disk KV cache restore failed: %s; falling back to prompt evaluation\n", error.what());
@@ -2068,6 +2449,11 @@ bool server_disk_kv_cache::save_prompt(server_prompt && prompt, bool wait_for_qu
         return false;
     }
 
+    queue_lock.unlock();
+    std::unique_lock<std::mutex> fs_lock(fs_mutex_);
+    queue_lock.lock();
+    if (io_stop_ || pending_saves_.size() >= MAX_PENDING_SAVES) { return false; }
+
     const std::string stem = stem_for_tokens(prompt.tokens);
     entry value;
     value.stem = stem;
@@ -2082,6 +2468,7 @@ bool server_disk_kv_cache::save_prompt(server_prompt && prompt, bool wait_for_qu
     pending_save pending;
     pending.value = std::move(value);
     pending.state = std::move(prompt.data);
+    pending.state_boundaries = std::move(prompt.state_boundaries);
     pending.checkpoints.reserve(prompt.checkpoints.size());
     for (auto & checkpoint : prompt.checkpoints) {
         if (checkpoint.n_tokens > 0 && checkpoint.n_tokens <= (int64_t) pending.value.tokens.size() &&
@@ -2125,14 +2512,14 @@ bool server_disk_kv_cache::save_prompt(server_prompt && prompt, bool wait_for_qu
     {
         bool replaced = false;
         for (auto & queued : pending_saves_) {
-            if (queued.value.stem == pending.value.stem) {
-                queued = std::move(pending);
+            if (queued->value.stem == pending.value.stem) {
+                queued = std::make_shared<const pending_save>(std::move(pending));
                 replaced = true;
                 break;
             }
         }
         if (!replaced) {
-            pending_saves_.push_back(std::move(pending));
+            pending_saves_.push_back(std::make_shared<const pending_save>(std::move(pending)));
         }
         queue_depth = pending_saves_.size();
     }
@@ -2150,61 +2537,60 @@ bool server_disk_kv_cache::save_prompt(server_prompt && prompt, bool wait_for_qu
 
 void server_disk_kv_cache::writer_loop() {
     while (true) {
-        pending_save pending;
+        std::shared_ptr<const pending_save> pending;
         {
             std::unique_lock<std::mutex> lock(io_mutex_);
             io_cv_.wait(lock, [this]() {
-                return io_stop_ || !pending_saves_.empty();
+                return io_stop_ || !pending_saves_.empty() || maintenance_requested_;
             });
-
-            if (pending_saves_.empty()) {
-                if (io_stop_) {
-                    break;
+            if (pending_saves_.empty() && !maintenance_requested_ && io_stop_) { break; }
+            maintenance_requested_ = false;
+            if (!pending_saves_.empty()) {
+                pending = std::move(pending_saves_.front());
+                pending_saves_.pop_front();
+                active_save active;
+                active.snapshot = pending;
+                active.blob_ids.reserve(pending->inherited_checkpoints.size());
+                for (const auto & checkpoint : pending->inherited_checkpoints) {
+                    if (!checkpoint.blob_id.empty()) { active.blob_ids.push_back(checkpoint.blob_id); }
                 }
-                continue;
+                active_saves_.push_back(std::move(active));
+                io_cv_.notify_all();
             }
-
-            pending = std::move(pending_saves_.front());
-            pending_saves_.pop_front();
-            active_save active;
-            active.tokens = pending.value.tokens.clone();
-            active.blob_ids.reserve(pending.checkpoints.size() + pending.inherited_checkpoints.size());
-            for (const auto & checkpoint : pending.inherited_checkpoints) {
-                if (!checkpoint.blob_id.empty()) {
-                    active.blob_ids.push_back(checkpoint.blob_id);
-                }
-            }
-            for (const auto & checkpoint : pending.checkpoints) {
-                if (checkpoint.n_tokens > 0 && !checkpoint.data.empty()) {
-                    active.blob_ids.push_back(checkpoint_blob_id(
-                        checkpoint.pos_min, checkpoint.pos_max, checkpoint.n_tokens, checkpoint.data));
-                }
-            }
-            active_saves_.push_back(std::move(active));
-            io_cv_.notify_all();
         }
-
-        write_pending_save(std::move(pending));
-
-        {
-            std::lock_guard<std::mutex> lock(io_mutex_);
-            if (!active_saves_.empty()) {
+        if (pending) {
+            try {
+                write_pending_save(std::move(pending));
+            } catch (const std::exception & err) {
+                LLAMA_LOG_WARN("disk KV cache background save failed: %s\n", err.what());
+            }
+            {
+                std::lock_guard<std::mutex> lock(io_mutex_);
                 active_saves_.pop_front();
             }
+            io_cv_.notify_all();
         }
-        io_cv_.notify_all();
+        try {
+            drain_completed_saves();
+        } catch (const std::exception & err) {
+            LLAMA_LOG_WARN("disk KV cache background maintenance failed: %s\n", err.what());
+        }
     }
 }
 
-void server_disk_kv_cache::write_pending_save(pending_save pending) {
-    std::lock_guard<std::mutex> fs_lock(fs_mutex_);
+void server_disk_kv_cache::write_pending_save(std::shared_ptr<const pending_save> snapshot) {
+    std::lock_guard<std::recursive_mutex> writer_guard(writer_gc_mutex_);
+    const auto & pending = *snapshot;
+    entry value = pending.value.clone();
 
-    const std::string stem = pending.value.stem;
-    const auto state_path = pending.value.state_path;
-    const auto meta_path = pending.value.meta_path;
-    const auto checkpoint_path = pending.value.checkpoint_path;
+    const std::string stem = value.stem;
+    const auto state_path = value.state_path;
+    const auto meta_path = value.meta_path;
+    const auto checkpoint_path = value.checkpoint_path;
     const auto state_tmp = namespace_path_ / (stem + ".state.tmp");
-    const auto meta_tmp = namespace_path_ / (stem + ".meta.tmp");
+    // Restore touches LRU metadata via .meta.tmp; preparation must not share
+    // its scratch path while it runs outside fs_mutex_.
+    const auto meta_tmp = namespace_path_ / (stem + ".meta.writer.tmp");
     const auto checkpoint_tmp = namespace_path_ / (stem + ".ckpt.tmp");
     const bool has_checkpoints = !pending.checkpoints.empty() || !pending.inherited_checkpoints.empty();
 
@@ -2216,22 +2602,13 @@ void server_disk_kv_cache::write_pending_save(pending_save pending) {
     ec.clear();
     std::filesystem::remove(checkpoint_tmp, ec);
 
-    {
-        std::ofstream file(state_tmp, std::ios::binary | std::ios::trunc);
-        if (!file) {
-            LLAMA_LOG_WARN("disk KV cache save failed while opening state file\n");
-            return;
-        }
-        file.write(reinterpret_cast<const char *>(pending.state.data()), (std::streamsize) pending.state.size());
-        file.flush();
-        if (!file.good()) {
-            std::filesystem::remove(state_tmp, ec);
-            LLAMA_LOG_WARN("disk KV cache save failed while writing state file\n");
-            return;
-        }
+    if (!write_state(state_tmp, pending, value)) {
+        std::filesystem::remove(state_tmp, ec);
+        LLAMA_LOG_WARN("disk KV cache save failed while writing state extents\n");
+        return;
     }
 
-    if (!write_metadata(meta_tmp, pending.value)) {
+    if (!write_metadata(meta_tmp, value)) {
         std::filesystem::remove(state_tmp, ec);
         std::filesystem::remove(meta_tmp, ec);
         LLAMA_LOG_WARN("disk KV cache save failed while writing metadata\n");
@@ -2239,7 +2616,7 @@ void server_disk_kv_cache::write_pending_save(pending_save pending) {
     }
 
     if (has_checkpoints &&
-        !write_checkpoint_file(checkpoint_tmp, pending.value, pending.checkpoints, pending.inherited_checkpoints)) {
+        !write_checkpoint_file(checkpoint_tmp, value, pending.checkpoints, pending.inherited_checkpoints)) {
         std::filesystem::remove(state_tmp, ec);
         std::filesystem::remove(meta_tmp, ec);
         std::filesystem::remove(checkpoint_tmp, ec);
@@ -2247,10 +2624,28 @@ void server_disk_kv_cache::write_pending_save(pending_save pending) {
         return;
     }
 
-    std::filesystem::remove(state_path, ec);
-    ec.clear();
-    std::filesystem::rename(state_tmp, state_path, ec);
+    const uintmax_t state_size = std::filesystem::file_size(state_tmp, ec);
     if (ec) {
+        return;
+    }
+    const uintmax_t meta_size = std::filesystem::file_size(meta_tmp, ec);
+    if (ec) {
+        return;
+    }
+    uintmax_t checkpoint_size = 0;
+    if (has_checkpoints) {
+        checkpoint_size = std::filesystem::file_size(checkpoint_tmp, ec);
+        if (ec) {
+            return;
+        }
+    }
+    value.size_bytes = (uint64_t) state_size + (uint64_t) meta_size + (uint64_t) checkpoint_size;
+
+    entry published = value.clone();
+    // File generation and its in-memory descriptor become visible together.
+    std::lock_guard<std::mutex> fs_lock(fs_mutex_);
+    entries_.reserve(entries_.size() + 1);
+    if (!disk_state_replace(state_tmp, state_path)) {
         std::filesystem::remove(state_tmp, ec);
         std::filesystem::remove(meta_tmp, ec);
         std::filesystem::remove(checkpoint_tmp, ec);
@@ -2282,29 +2677,20 @@ void server_disk_kv_cache::write_pending_save(pending_save pending) {
         return;
     }
 
-    const uintmax_t state_size = std::filesystem::file_size(state_path, ec);
-    if (ec) {
-        return;
-    }
-    const uintmax_t meta_size = std::filesystem::file_size(meta_path, ec);
-    if (ec) {
-        return;
-    }
-    uintmax_t checkpoint_size = 0;
-    if (has_checkpoints) {
-        checkpoint_size = std::filesystem::file_size(checkpoint_path, ec);
-        if (ec) {
-            return;
-        }
-    }
-    pending.value.size_bytes = (uint64_t) state_size + (uint64_t) meta_size + (uint64_t) checkpoint_size;
+    published.size_bytes = value.size_bytes;
+    auto existing = std::find_if(entries_.begin(), entries_.end(), [&](const entry & current) {
+        return current.stem == published.stem;
+    });
+    if (existing != entries_.end()) { *existing = std::move(published); }
+    else { entries_.push_back(std::move(published)); }
 
-    const size_t token_count = pending.value.tokens.size();
-    const size_t checkpoint_count = pending.value.checkpoints.size();
+    const size_t token_count = value.tokens.size();
+    const size_t checkpoint_count = value.checkpoints.size();
     size_t queue_depth = 0;
     {
         std::lock_guard<std::mutex> lock(io_mutex_);
-        completed_saves_.push_back(std::move(pending.value));
+        value.snapshot = std::move(snapshot);
+        completed_saves_.push_back(std::move(value));
         queue_depth = pending_saves_.size();
     }
 

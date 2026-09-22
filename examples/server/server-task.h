@@ -394,6 +394,7 @@ struct server_prompt {
     std::vector<uint8_t> data;
 
     std::list<server_prompt_checkpoint> checkpoints;
+    std::vector<size_t> state_boundaries;
 
     size_t size() const;
 
@@ -408,7 +409,8 @@ struct server_prompt {
             n_discarded_prompt,
             think_tokens,
             data,
-            checkpoints
+            checkpoints,
+            state_boundaries
         };
     }
 

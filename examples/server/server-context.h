@@ -238,6 +238,15 @@ public:
     bool save_prompt(server_prompt && prompt, bool wait_for_queue = false);
 
 private:
+    struct pending_save;
+    struct state_extent {
+        std::string pack;
+        uint64_t offset = 0;
+        uint64_t size = 0;
+        uint64_t hash = 0;
+        uint64_t stream = 0;
+        uint64_t position = 0;
+    };
     struct entry {
         struct checkpoint_index {
             llama_pos pos_min = 0;
@@ -261,17 +270,34 @@ private:
         int32_t n_discarded_prompt = 0;
         uint64_t size_bytes = 0;
         uint64_t last_used = 0;
+        std::vector<state_extent> state_extents;
+        uint64_t state_size = 0; // zero identifies a legacy monolithic state
+        bool eviction_failed = false;
+        bool gc_only = false; // metadata removed, remaining files still pin shared data
+        std::shared_ptr<const pending_save> snapshot; // only during writer-to-reader handoff
+
+        entry clone() const {
+            entry result;
+            result.stem = stem; result.state_path = state_path; result.meta_path = meta_path;
+            result.checkpoint_path = checkpoint_path; result.tokens = tokens.clone();
+            result.checkpoints = checkpoints; result.n_kept_prompt = n_kept_prompt;
+            result.n_discarded_prompt = n_discarded_prompt; result.size_bytes = size_bytes;
+            result.last_used = last_used; result.state_extents = state_extents; result.state_size = state_size;
+            result.eviction_failed = eviction_failed; result.gc_only = gc_only;
+            return result;
+        }
     };
 
     struct pending_save {
         entry value;
         std::vector<uint8_t> state;
+        std::vector<size_t> state_boundaries;
         std::vector<server_prompt_checkpoint> checkpoints;
         std::vector<entry::checkpoint_index> inherited_checkpoints;
     };
 
     struct active_save {
-        server_tokens tokens;
+        std::shared_ptr<const pending_save> snapshot;
         std::vector<std::string> blob_ids;
     };
 
@@ -298,12 +324,16 @@ private:
 
     std::mutex io_mutex_;
     std::mutex fs_mutex_;
+    // Writer holds this during unlocked immutable-file I/O; GC/compaction
+    // only try_lock it, so request handling never waits for dedup.
+    std::recursive_mutex writer_gc_mutex_;
     std::condition_variable io_cv_;
-    std::deque<pending_save> pending_saves_;
+    std::deque<std::shared_ptr<const pending_save>> pending_saves_;
     std::deque<active_save> active_saves_;
     std::deque<entry> completed_saves_;
     std::thread io_thread_;
     bool io_stop_ = false;
+    bool maintenance_requested_ = false;
     static constexpr size_t MAX_PENDING_SAVES = 2;
 
     static uint64_t now_ticks();
@@ -320,6 +350,11 @@ private:
     bool write_checkpoint_blob(const server_prompt_checkpoint & checkpoint, std::string & blob_id) const;
     bool read_checkpoint_blob(const entry::checkpoint_index & checkpoint, std::vector<uint8_t> & data) const;
     void scan();
+    bool read_state_index(entry & value) const;
+    bool read_state(const entry & value, std::vector<uint8_t> & data) const;
+    bool write_state(const std::filesystem::path & path, const pending_save & pending, entry & value);
+    bool write_state_index(const std::filesystem::path & path, const entry & value) const;
+    void compact_state_packs(std::unique_lock<std::mutex> & fs_lock);
     bool read_metadata(const std::filesystem::path & path, entry & result) const;
     bool read_checkpoint_index(const std::filesystem::path & path, entry & result) const;
     bool write_metadata(const std::filesystem::path & path, const entry & value) const;
@@ -328,16 +363,14 @@ private:
         entry & value,
         const std::vector<server_prompt_checkpoint> & checkpoints,
         const std::vector<entry::checkpoint_index> & inherited_checkpoints) const;
-    bool remove_entry_files(const entry & value);
+    bool remove_entry_files(entry & value);
     void rebuild_usage();
     void gc_unreferenced_blobs();
     void evict_if_needed(const std::string & keep_stem = "");
     void prune_missing_entries();
     void writer_loop();
-    void write_pending_save(pending_save pending);
+    void write_pending_save(std::shared_ptr<const pending_save> snapshot);
     void drain_completed_saves();
-    bool has_matching_pending_save_locked(const server_tokens & requested, float min_reusable_fraction) const;
-    bool wait_for_matching_pending_save(const server_tokens & requested, float min_reusable_fraction);
 };
 
 struct server_metrics {

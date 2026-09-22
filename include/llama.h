@@ -1045,6 +1045,13 @@ extern "C" {
                     llama_seq_id   seq_id,
            llama_state_seq_flags   flags);
 
+    // Same byte stream as get_data; reports starts of independently serialized
+    // tensor streams (including each transposed V row), for storage extent sharing.
+    LLAMA_API size_t llama_state_seq_get_data_ext(
+            struct llama_context * ctx, uint8_t * dst, size_t size,
+            llama_seq_id seq_id, llama_state_seq_flags flags,
+            void (*boundary)(size_t offset, void * user_data), void * user_data);
+
     // Copy the sequence data (originally copied with `llama_state_seq_get_data`) into the specified sequence
     // Returns:
     //  - Positive: Ok
