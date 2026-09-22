@@ -517,7 +517,7 @@ void server_context::init() {
 
     if (prompt_cache && disk_kv_cache && disk_kv_cache->enabled()) {
         prompt_cache->set_evict_callback([this](server_prompt && prompt) {
-            disk_kv_cache->save_prompt(std::move(prompt));
+            return disk_kv_cache->save_prompt(std::move(prompt));
         });
     }
 
@@ -1305,11 +1305,71 @@ void server_disk_kv_cache::drain_completed_saves() {
     }
 }
 
+bool server_disk_kv_cache::has_matching_pending_save_locked(const server_tokens & requested, float min_reusable_fraction) const {
+    const auto matches = [&](const entry & candidate) {
+        if (has_media_tokens(candidate.tokens)) {
+            return false;
+        }
+
+        const size_t lcp = common_prefix_tokens(candidate.tokens, requested);
+        const size_t fraction_tokens = (size_t) std::ceil(std::max(0.0f, min_reusable_fraction) * candidate.tokens.size());
+        const size_t required = std::min(candidate.tokens.size(), std::max<size_t>(1, std::min<size_t>(32, fraction_tokens)));
+        return lcp >= required;
+    };
+
+    for (const auto & pending : pending_saves_) {
+        if (matches(pending.value)) {
+            return true;
+        }
+    }
+    for (const auto & active : active_saves_) {
+        entry candidate;
+        candidate.tokens = active.tokens.clone();
+        if (matches(candidate)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool server_disk_kv_cache::wait_for_matching_pending_save(const server_tokens & requested, float min_reusable_fraction) {
+    std::unique_lock<std::mutex> lock(io_mutex_);
+    if (!has_matching_pending_save_locked(requested, min_reusable_fraction)) {
+        return false;
+    }
+
+    io_cv_.wait(lock, [this, &requested, min_reusable_fraction]() {
+        return io_stop_ || !has_matching_pending_save_locked(requested, min_reusable_fraction);
+    });
+    return true;
+}
+
 bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & requested, float min_reusable_fraction, bool has_mtmd) {
     drain_completed_saves();
 
     if (!enabled_ || requested.empty() || has_media_tokens(requested)) {
         return false;
+    }
+
+    const auto matches_disk_entry = [&](const entry & candidate) {
+        if (has_media_tokens(candidate.tokens)) {
+            return false;
+        }
+
+        const size_t lcp = common_prefix_tokens(candidate.tokens, requested);
+        const size_t fraction_tokens = (size_t) std::ceil(std::max(0.0f, min_reusable_fraction) * candidate.tokens.size());
+        const size_t required = std::min(candidate.tokens.size(), std::max<size_t>(1, std::min<size_t>(32, fraction_tokens)));
+        return lcp >= required;
+    };
+
+    if (std::none_of(entries_.begin(), entries_.end(), matches_disk_entry)) {
+        const int64_t wait_start = ggml_time_us();
+        if (wait_for_matching_pending_save(requested, min_reusable_fraction)) {
+            drain_completed_saves();
+            LOG_INFO("disk KV cache waited for matching save", {
+                {"wait_ms", (ggml_time_us() - wait_start) / 1000.0},
+            });
+        }
     }
 
     const size_t current_lcp = slot.cache_tokens.empty() ? 0 : common_prefix_tokens(slot.cache_tokens, requested);
@@ -1577,10 +1637,21 @@ void server_disk_kv_cache::writer_loop() {
 
             pending = std::move(pending_saves_.front());
             pending_saves_.pop_front();
+            active_save active;
+            active.tokens = pending.value.tokens.clone();
+            active_saves_.push_back(std::move(active));
             io_cv_.notify_all();
         }
 
         write_pending_save(std::move(pending));
+
+        {
+            std::lock_guard<std::mutex> lock(io_mutex_);
+            if (!active_saves_.empty()) {
+                active_saves_.pop_front();
+            }
+        }
+        io_cv_.notify_all();
     }
 }
 

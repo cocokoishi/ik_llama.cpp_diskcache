@@ -1203,16 +1203,18 @@ server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t st
 
 void server_prompt_cache::update() {
     if (limit_size > 0) {
-        // always keep at least one state, regardless of the limits
-        while (states.size() > 1 && size() > limit_size) {
-            if (states.empty()) {
-                break;
-            }
+        // With a disk second-level cache, a single oversized RAM entry must
+        // also be spillable.  Without a successful callback, keep it in RAM
+        // rather than silently dropping the only recoverable copy.
+        while (!states.empty() && size() > limit_size && (states.size() > 1 || on_evict)) {
 
             LLAMA_LOG_INFO(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
             if (on_evict) {
-                on_evict(std::move(states.front()));
+                if (!on_evict(std::move(states.front()))) {
+                    LLAMA_LOG_WARN(" - disk cache spill failed; retaining oldest RAM prompt\n");
+                    break;
+                }
             }
             states.pop_front();
         }

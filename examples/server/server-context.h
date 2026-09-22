@@ -264,6 +264,10 @@ private:
         std::vector<server_prompt_checkpoint> checkpoints;
     };
 
+    struct active_save {
+        server_tokens tokens;
+    };
+
     static constexpr uint32_t META_MAGIC = 0x3143564b; // "KVC1"
     static constexpr uint32_t META_VERSION = 3;
     static constexpr uint32_t CHECKPOINT_MAGIC = 0x31545043; // "CPT1"
@@ -282,6 +286,7 @@ private:
     std::mutex fs_mutex_;
     std::condition_variable io_cv_;
     std::deque<pending_save> pending_saves_;
+    std::deque<active_save> active_saves_;
     std::deque<entry> completed_saves_;
     std::thread io_thread_;
     bool io_stop_ = false;
@@ -307,6 +312,8 @@ private:
     void writer_loop();
     void write_pending_save(pending_save pending);
     void drain_completed_saves();
+    bool has_matching_pending_save_locked(const server_tokens & requested, float min_reusable_fraction) const;
+    bool wait_for_matching_pending_save(const server_tokens & requested, float min_reusable_fraction);
 };
 
 struct server_metrics {
