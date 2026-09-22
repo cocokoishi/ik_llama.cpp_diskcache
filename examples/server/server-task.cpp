@@ -1131,6 +1131,8 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
         const size_t n = llama_state_seq_set_data(ctx, it_best->data.data(), size, id_slot, 0);
         if (n != size) {
             LLAMA_LOG_INFO("failed to restore state with size %zu\n", size);
+            llama_kv_cache_seq_rm(ctx, id_slot, -1, -1);
+            prompt = server_prompt{};
             return false;
         }
 

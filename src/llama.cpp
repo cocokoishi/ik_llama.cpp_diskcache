@@ -10993,14 +10993,58 @@ struct llama_data_read {
         }
     }
 
-    bool read_kv_cache_meta(struct llama_context * ctx, uint32_t cell_count, llama_seq_id dest_seq_id = -1) {
+    bool read_kv_cache_meta(struct llama_context * ctx, uint32_t cell_count, llama_seq_id dest_seq_id = -1, bool keep_kv = false) {
         struct llama_kv_cache & kv_self = ctx->kv_self;
+
+        if (keep_kv) {
+            // Partial blobs omit ordinary attention K/V. Reallocating their
+            // metadata would point those positions at unrelated tensor rows.
+            // Match positions in the full state and retain their physical cells.
+            if (dest_seq_id < 0 || kv_self.recurrent || cell_count == 0 || cell_count > kv_self.size) {
+                return false;
+            }
+            std::set<llama_pos> positions;
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                llama_pos pos;
+                uint32_t n_seq_id;
+                read_to(&pos, sizeof(pos));
+                read_to(&n_seq_id, sizeof(n_seq_id));
+                if (pos < 0 || n_seq_id != 0 || !positions.insert(pos).second) {
+                    return false;
+                }
+            }
+            auto missing = positions;
+            for (const auto & cell : kv_self.cells) {
+                if (cell.has_seq_id(dest_seq_id)) {
+                    missing.erase(cell.pos);
+                }
+            }
+            if (!missing.empty()) {
+                return false;
+            }
+            for (uint32_t i = 0; i < kv_self.size; ++i) {
+                auto & cell = kv_self.cells[i];
+                if (!cell.has_seq_id(dest_seq_id) || positions.count(cell.pos)) {
+                    continue;
+                }
+                cell.seq_id.erase(dest_seq_id);
+                if (cell.is_empty()) {
+                    if (cell.pos >= 0) {
+                        --kv_self.used;
+                    }
+                    cell.pos = -1;
+                    cell.src = i;
+                    kv_self.head = std::min(kv_self.head, i);
+                }
+            }
+            return true;
+        }
 
         if (dest_seq_id != -1) {
             // single sequence
 
-            if (cell_count == 0 && ctx->model.arch == LLM_ARCH_OPENPANGU) {
-                LLAMA_LOG_ERROR("%s: openPangu sequence state carries no kv cells\n", __func__);
+            if (dest_seq_id < 0 || (uint32_t) dest_seq_id >= llama_n_seq_max(ctx) ||
+                cell_count == 0 || (kv_self.recurrent && cell_count != 1)) {
                 return false;
             }
 
@@ -11020,7 +11064,7 @@ struct llama_data_read {
                 read_to(&pos, sizeof(pos));
                 read_to(&n_seq_id, sizeof(n_seq_id));
 
-                if (n_seq_id != 0) {
+                if (n_seq_id != 0 || pos < 0) {
 		    llama_batch_free(batch);
                     LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
                     return false;
@@ -11034,6 +11078,13 @@ struct llama_data_read {
                 llama_batch_free(batch);
                 LLAMA_LOG_ERROR("%s: failed to find available cells in kv cache\n", __func__);
                 return false;
+            }
+
+            if (kv_self.recurrent) {
+                // find_slot normally leaves membership to decode's input
+                // setup. Restoring a full state does not run that setup.
+                kv_self.cells[dest_seq_id].seq_id.insert(dest_seq_id);
+                kv_self.cells[dest_seq_id].src = dest_seq_id;
             }
 
             // DEBUG CHECK: kv_self.head should be our first cell, kv_self.head + cell_count - 1 should be our last cell (verify seq_id and pos values)
@@ -11694,7 +11745,11 @@ struct llama_data_read {
         }
 
         // scalars before rows: they set the placement offset, and seq_rm inside meta resets head_swa
-        bool res = read_kv_cache_meta(ctx, cell_count, seq_id);
+        const bool keep_kv = (flags & LLAMA_STATE_SEQ_FLAGS_KEEP_KV) != 0;
+        if (keep_kv && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+            throw std::runtime_error("KEEP_KV requires PARTIAL_ONLY");
+        }
+        bool res = read_kv_cache_meta(ctx, cell_count, seq_id, keep_kv);
         if (res && compact_blob) {
             kv_self.pos_base_swa = restore_pos_base;
             kv_self.head_swa     = restore_head_swa;

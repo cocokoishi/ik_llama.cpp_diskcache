@@ -235,7 +235,7 @@ public:
     }
 
     bool load_best(server_slot & slot, const server_tokens & requested, float min_reusable_fraction, bool has_mtmd);
-    bool save_prompt(server_prompt prompt, bool wait_for_queue = false);
+    bool save_prompt(server_prompt && prompt, bool wait_for_queue = false);
 
 private:
     struct entry {
@@ -276,7 +276,7 @@ private:
     };
 
     static constexpr uint32_t META_MAGIC = 0x3143564b; // "KVC1"
-    static constexpr uint32_t META_VERSION = 3;
+    static constexpr uint32_t META_VERSION = 4;
     static constexpr uint32_t CHECKPOINT_MAGIC = 0x31545043; // "CPT1"
     static constexpr uint32_t CHECKPOINT_VERSION = 2;
     static constexpr uint32_t BLOB_MAGIC = 0x3142564b; // "KVB1"
@@ -307,8 +307,7 @@ private:
     static constexpr size_t MAX_PENDING_SAVES = 2;
 
     static uint64_t now_ticks();
-    static bool has_media_tokens(const server_tokens & tokens);
-    static size_t common_prefix_tokens(const server_tokens & a, const server_tokens & b);
+    size_t common_prefix_tokens(const server_tokens & a, const server_tokens & b) const;
 
     std::string stem_for_tokens(const server_tokens & tokens) const;
     std::string checkpoint_blob_id(

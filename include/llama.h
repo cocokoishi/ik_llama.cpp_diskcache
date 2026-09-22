@@ -835,6 +835,12 @@ extern "C" {
     // work only with partial states, such as recurrent cache (e.g. Mamba)
 #define LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY 1
 
+    // Restore-only: PARTIAL_ONLY overlays a previously loaded full state of
+    // the same token history. Keep omitted K/V rows at their existing cells,
+    // validating that every checkpoint position is present. The caller must
+    // clear the sequence on failure. Not supported for pure recurrent caches.
+#define LLAMA_STATE_SEQ_FLAGS_KEEP_KV 2
+
     typedef uint32_t llama_state_seq_flags;
 
     // Create an empty KV cache view. (use only for debugging purposes)

@@ -589,6 +589,16 @@ bool server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_to
     const bool res = prompt_cache.load(server_cached_prompt, tokens, ctx, id, min_reusable_fraction);
     if (!res) {
         LLAMA_LOG_INFO("failed to load prompt from cache\n");
+        if (server_cached_prompt.tokens.empty()) {
+            // load() clears the prompt on a failed state write, but leaves it
+            // untouched on an ordinary miss. Never compare stale slot tokens
+            // against disk candidates after a partially applied RAM restore.
+            common_speculative_clear_sequence_kv(spec, ctx, id);
+            cache_tokens = server_tokens();
+            n_past = n_past_prompt = n_past_se = 0;
+            n_kept_prompt = n_discarded_prompt = ga_i = 0;
+            checkpoint_pos = -1;
+        }
     }
     return res;
 }
@@ -758,19 +768,19 @@ uint64_t server_disk_kv_cache::now_ticks() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-bool server_disk_kv_cache::has_media_tokens(const server_tokens & tokens) {
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        if (tokens[i] == LLAMA_TOKEN_NULL) {
-            return true;
-        }
+size_t server_disk_kv_cache::common_prefix_tokens(const server_tokens & a, const server_tokens & b) const {
+    // A media placeholder is not a token identity by itself: two different
+    // images/audio chunks both use LLAMA_TOKEN_NULL.  Use server_tokens'
+    // exact multimodal comparison whenever both sides carry media metadata.
+    // If only one side has media metadata, stop at the first placeholder and
+    // compare the preceding ordinary token stream conservatively.
+    if (a.has_mtmd && b.has_mtmd) {
+        return a.get_common_prefix_exact(b);
     }
-    return false;
-}
 
-size_t server_disk_kv_cache::common_prefix_tokens(const server_tokens & a, const server_tokens & b) {
     const size_t n = std::min(a.size(), b.size());
     size_t i = 0;
-    for (; i < n && a[i] == b[i]; ++i) {
+    for (; i < n && a[i] == b[i] && a[i] != LLAMA_TOKEN_NULL; ++i) {
     }
     return i;
 }
@@ -847,11 +857,19 @@ server_disk_kv_cache::~server_disk_kv_cache() {
 }
 
 std::string server_disk_kv_cache::stem_for_tokens(const server_tokens & tokens) const {
-    std::vector<uint8_t> key(sizeof(uint64_t) + tokens.size() * sizeof(llama_token));
+    const std::string media_identity = tokens.has_mtmd ? tokens.to_json().dump() : std::string();
+    const size_t extra_size = tokens.has_mtmd ? sizeof(uint64_t) + media_identity.size() : 0;
+    std::vector<uint8_t> key(sizeof(uint64_t) + tokens.size() * sizeof(llama_token) + extra_size);
     const uint64_t n_tokens = tokens.size();
     std::memcpy(key.data(), &n_tokens, sizeof(n_tokens));
     for (size_t i = 0; i < tokens.size(); ++i) {
         std::memcpy(key.data() + sizeof(n_tokens) + i * sizeof(llama_token), &tokens[i], sizeof(llama_token));
+    }
+    if (tokens.has_mtmd) {
+        const uint64_t media_size = media_identity.size();
+        const size_t media_offset = sizeof(n_tokens) + tokens.size() * sizeof(llama_token);
+        std::memcpy(key.data() + media_offset, &media_size, sizeof(media_size));
+        std::memcpy(key.data() + media_offset + sizeof(media_size), media_identity.data(), media_identity.size());
     }
     return "prefix-" + fnv_hash(key.data(), key.size());
 }
@@ -1090,14 +1108,44 @@ bool server_disk_kv_cache::read_metadata(const std::filesystem::path & path, ent
     file.read(reinterpret_cast<char *>(&n_discarded_prompt), sizeof(n_discarded_prompt));
     file.read(reinterpret_cast<char *>(&last_used), sizeof(last_used));
 
-    if (!file || magic != META_MAGIC || version != META_VERSION || n_tokens == 0 ||
+    if (!file || magic != META_MAGIC || (version != 3 && version != META_VERSION) || n_tokens == 0 ||
         n_tokens > (uint64_t) llama_n_ctx(ctx_)) {
         return false;
     }
 
-    std::vector<llama_token> tokens((size_t) n_tokens);
-    file.read(reinterpret_cast<char *>(tokens.data()), tokens.size() * sizeof(llama_token));
-    if (!file) {
+    try {
+        if (version == 3) {
+            std::vector<llama_token> tokens((size_t) n_tokens);
+            file.read(reinterpret_cast<char *>(tokens.data()), tokens.size() * sizeof(llama_token));
+            if (!file) {
+                return false;
+            }
+            result.tokens = server_tokens(tokens, false);
+        }
+        else {
+            uint64_t serialized_size = 0;
+            file.read(reinterpret_cast<char *>(&serialized_size), sizeof(serialized_size));
+            // Metadata is generated locally and should remain tiny even for a
+            // large multimodal prompt.  Refuse hostile/corrupt allocations.
+            if (!file || serialized_size == 0 || serialized_size > 64ull * 1024ull * 1024ull) {
+                return false;
+            }
+            std::string serialized((size_t) serialized_size, '\0');
+            file.read(serialized.data(), (std::streamsize) serialized.size());
+            if (!file) {
+                return false;
+            }
+            json token_json = json::parse(serialized);
+            result.tokens.from_json(token_json);
+            if (result.tokens.size() != n_tokens) {
+                return false;
+            }
+        }
+        if (!result.tokens.validate(ctx_)) {
+            return false;
+        }
+    }
+    catch (const std::exception &) {
         return false;
     }
 
@@ -1107,7 +1155,6 @@ bool server_disk_kv_cache::read_metadata(const std::filesystem::path & path, ent
     result.state_path.replace_extension(".state");
     result.checkpoint_path = path;
     result.checkpoint_path.replace_extension(".ckpt");
-    result.tokens = server_tokens(tokens, false);
     result.n_kept_prompt = n_kept_prompt;
     result.n_discarded_prompt = n_discarded_prompt;
     result.last_used = last_used != 0 ? last_used : now_ticks();
@@ -1205,10 +1252,10 @@ bool server_disk_kv_cache::write_metadata(const std::filesystem::path & path, co
     file.write(reinterpret_cast<const char *>(&value.n_discarded_prompt), sizeof(value.n_discarded_prompt));
     file.write(reinterpret_cast<const char *>(&value.last_used), sizeof(value.last_used));
 
-    for (size_t i = 0; i < value.tokens.size(); ++i) {
-        const llama_token token = value.tokens[i];
-        file.write(reinterpret_cast<const char *>(&token), sizeof(token));
-    }
+    const std::string serialized = value.tokens.to_json().dump();
+    const uint64_t serialized_size = serialized.size();
+    file.write(reinterpret_cast<const char *>(&serialized_size), sizeof(serialized_size));
+    file.write(serialized.data(), (std::streamsize) serialized.size());
     file.flush();
     return file.good();
 }
@@ -1640,15 +1687,10 @@ void server_disk_kv_cache::drain_completed_saves() {
 }
 
 bool server_disk_kv_cache::has_matching_pending_save_locked(const server_tokens & requested, float min_reusable_fraction) const {
+    (void) min_reusable_fraction; // RAM similarity is not a disk prefix cutoff.
     const auto matches = [&](const entry & candidate) {
-        if (has_media_tokens(candidate.tokens)) {
-            return false;
-        }
-
         const size_t lcp = common_prefix_tokens(candidate.tokens, requested);
-        const size_t fraction_tokens = (size_t) std::ceil(std::max(0.0f, min_reusable_fraction) * candidate.tokens.size());
-        const size_t required = std::min(candidate.tokens.size(), std::max<size_t>(1, std::min<size_t>(32, fraction_tokens)));
-        return lcp >= required;
+        return lcp > 0;
     };
 
     for (const auto & pending : pending_saves_) {
@@ -1681,22 +1723,16 @@ bool server_disk_kv_cache::wait_for_matching_pending_save(const server_tokens & 
 bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & requested, float min_reusable_fraction, bool has_mtmd) {
     drain_completed_saves();
 
-    if (!enabled_ || requested.empty() || has_media_tokens(requested)) {
+    const auto * model = llama_get_model(ctx_);
+    // The disk token geometry has no self-extend map. These private-state
+    // models also have host-side history not carried by public sequence I/O.
+    if (!enabled_ || requested.empty() || slot.ga_n != 1 ||
+        llama_model_is_qwen4exp(model) || llama_model_is_deepseek4(model)) {
         return false;
     }
 
-    const auto matches_disk_entry = [&](const entry & candidate) {
-        if (has_media_tokens(candidate.tokens)) {
-            return false;
-        }
-
-        const size_t lcp = common_prefix_tokens(candidate.tokens, requested);
-        const size_t fraction_tokens = (size_t) std::ceil(std::max(0.0f, min_reusable_fraction) * candidate.tokens.size());
-        const size_t required = std::min(candidate.tokens.size(), std::max<size_t>(1, std::min<size_t>(32, fraction_tokens)));
-        return lcp >= required;
-    };
-
-    if (std::none_of(entries_.begin(), entries_.end(), matches_disk_entry)) {
+    // A shallow committed match must not hide a better in-flight snapshot.
+    {
         const int64_t wait_start = ggml_time_us();
         if (wait_for_matching_pending_save(requested, min_reusable_fraction)) {
             drain_completed_saves();
@@ -1706,27 +1742,31 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
         }
     }
 
-    const size_t current_lcp = slot.cache_tokens.empty() ? 0 : common_prefix_tokens(slot.cache_tokens, requested);
+    const size_t current_lcp = common_prefix_tokens(slot.cache_tokens, requested);
     const bool full_state_truncation_safe =
-        !llama_model_has_recurrent(llama_get_model(ctx_)) &&
+        !llama_model_has_recurrent(model) &&
+        llama_model_supports_ctx_shift(model) &&
         !llama_kv_cache_is_compacted(ctx_) &&
         slot.ga_n == 1;
+    // A live recurrent suffix is not a restorable prefix. Do not let its raw
+    // LCP suppress a deeper disk checkpoint or a complete prefix snapshot.
+    const size_t current_restorable = slot.n_discarded_prompt == 0 &&
+        !slot.cache_tokens.empty() &&
+        llama_kv_cache_seq_pos_max(ctx_, slot.id) == slot.cache_tokens.pos_next() - 1 &&
+        (current_lcp == slot.cache_tokens.size() || full_state_truncation_safe)
+        ? current_lcp : 0;
     size_t best = std::numeric_limits<size_t>::max();
     size_t best_lcp = current_lcp;
-    size_t best_restore_tokens = current_lcp;
+    size_t best_restore_tokens = current_restorable;
     size_t best_checkpoint = std::numeric_limits<size_t>::max();
     bool best_full_truncate = false;
 
     for (size_t i = 0; i < entries_.size(); ++i) {
         const entry & candidate = entries_[i];
-        if (has_media_tokens(candidate.tokens)) {
-            continue;
-        }
-
         const size_t lcp = common_prefix_tokens(candidate.tokens, requested);
-        const size_t fraction_tokens = (size_t) std::ceil(std::max(0.0f, min_reusable_fraction) * candidate.tokens.size());
-        const size_t required = std::min(candidate.tokens.size(), std::max<size_t>(1, std::min<size_t>(32, fraction_tokens)));
-        if (lcp < required) {
+        // Shifted retained tokens are not the history that produced their KV.
+        // The current format cannot prove equivalence with an unshifted request.
+        if (lcp == 0 || candidate.n_discarded_prompt != 0 || candidate.n_kept_prompt < 0) {
             continue;
         }
 
@@ -1739,14 +1779,26 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
         size_t restore_tokens = 0;
         size_t checkpoint = std::numeric_limits<size_t>::max();
         bool full_truncate = false;
-        if (full_state_truncation_safe) {
+        const bool candidate_is_request_prefix = lcp == candidate.tokens.size() &&
+            candidate.tokens.size() <= requested.size();
+        if (candidate_is_request_prefix) {
+            // Hybrid/recurrent state cannot be suffix-truncated, but an exact
+            // prefix extension does not need a rollback at all.  Restore the
+            // complete sequence state and let the normal prompt path append
+            // only the requested suffix.
+            restore_tokens = candidate.tokens.size();
+        }
+        else if (full_state_truncation_safe) {
             restore_tokens = lcp;
             full_truncate = lcp != candidate.tokens.size();
         } else {
             for (size_t j = 0; j < candidate.checkpoints.size(); ++j) {
                 const auto & cur = candidate.checkpoints[j];
                 if (cur.n_tokens <= 0 || cur.n_tokens >= (int64_t) requested.size() ||
-                    cur.n_tokens > (int64_t) lcp) {
+                    cur.n_tokens > (int64_t) lcp ||
+                    cur.pos_max != candidate.tokens.pos_next(cur.n_tokens) - 1 ||
+                    (cur.n_tokens < (int64_t) candidate.tokens.size() &&
+                        candidate.tokens[cur.n_tokens] == LLAMA_TOKEN_NULL)) {
                     continue;
                 }
                 if (checkpoint == std::numeric_limits<size_t>::max() ||
@@ -1760,7 +1812,7 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
             }
         }
 
-        if (restore_tokens <= current_lcp) {
+        if (restore_tokens <= current_restorable) {
             continue;
         }
 
@@ -1830,12 +1882,28 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
 
     server_prompt_checkpoint restored_checkpoint{};
     bool have_restored_checkpoint = false;
-    {
+    const auto clear_restore = [&]() {
+        common_speculative_clear_sequence_kv(slot.spec, ctx_, slot.id);
+        slot.cache_tokens = server_tokens();
+        slot.cache_tokens.has_mtmd = has_mtmd;
+        slot.server_cached_prompt = server_prompt{};
+        slot.server_cached_prompt.tokens.has_mtmd = has_mtmd;
+        slot.n_past = slot.n_past_prompt = slot.n_past_se = 0;
+        slot.n_kept_prompt = slot.n_discarded_prompt = 0;
+        slot.n_prompt_tokens_cache = 0;
+        slot.ga_i = 0;
+        slot.checkpoint_pos = -1;
+        slot.do_checkpoint = slot.image_just_processed = false;
+    };
+    try {
         std::lock_guard<std::mutex> fs_lock(fs_mutex_);
         bool valid = false;
         std::vector<uint8_t> state;
         std::error_code ec;
-        if (load_full_state) {
+        // Partial checkpoints omit ordinary attention K/V, so always restore
+        // their owning full state first. KEEP_KV overlays checkpoint metadata
+        // without relocating the omitted tensor rows.
+        {
             const uintmax_t state_size = std::filesystem::file_size(candidate.state_path, ec);
             if (!ec && state_size > 0 && state_size <= std::numeric_limits<size_t>::max()) {
                 state.resize((size_t) state_size);
@@ -1845,8 +1913,18 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
                     valid = file.gcount() == (std::streamsize) state.size();
                 }
             }
-        } else {
+        }
+        if (valid) {
+            common_speculative_clear_sequence_kv(slot.spec, ctx_, slot.id);
+            valid = llama_state_seq_set_data(ctx_, state.data(), state.size(), slot.id, 0) == state.size();
+            // Check the full geometry BEFORE any suffix deletion. pos_next()
+            // describes unshifted token/media positions, not self-extend or a
+            // separate server-level system-prefix offset.
+            valid = valid && llama_kv_cache_seq_pos_max(ctx_, slot.id) == candidate.tokens.pos_next() - 1;
+        }
+        if (valid && !load_full_state) {
             const auto & checkpoint = candidate.checkpoints[best_checkpoint];
+            valid = false;
             if (!checkpoint.blob_id.empty()) {
                 valid = read_checkpoint_blob(checkpoint, state);
             }
@@ -1859,21 +1937,25 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
                     valid = file.gcount() == (std::streamsize) state.size();
                 }
             }
+                if (valid) {
+                    // openPangu partial state deliberately has no cell metadata;
+                    // its conv state is applied after moving to its exact position.
+                    if (llama_model_is_openpangu(model)) {
+                        valid = llama_kv_cache_seq_rm(ctx_, slot.id, checkpoint.pos_max + 1, -1);
+                    }
+                    if (valid) {
+                        const llama_state_seq_flags checkpoint_flags =
+                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+                            (llama_model_is_recurrent(model) ? 0 : LLAMA_STATE_SEQ_FLAGS_KEEP_KV);
+                        valid = llama_state_seq_set_data(ctx_, state.data(), state.size(), slot.id,
+                            checkpoint_flags) == state.size();
+                    }
+            }
         }
-
-        if (valid) {
-            if (!load_full_state) {
-                // Match apply_checkpoint(): discard the slot's old sequence
-                // before restoring a partial state, including hybrid SSM rows.
-                llama_kv_cache_seq_rm(ctx_, slot.id, -1, -1);
-            }
-            const size_t nset = llama_state_seq_set_data(
-                ctx_, state.data(), state.size(), slot.id,
-                load_full_state ? 0 : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            valid = nset == state.size();
-            if (valid && load_full_state && best_full_truncate) {
-                valid = llama_kv_cache_seq_rm(ctx_, slot.id, (llama_pos) restore_tokens, -1);
-            }
+        if (valid && load_full_state && best_full_truncate) {
+            // The admitted state has unshifted token/media geometry.
+            const llama_pos truncate_pos = candidate.tokens.pos_next(restore_tokens);
+            valid = llama_kv_cache_seq_rm(ctx_, slot.id, truncate_pos, -1);
         }
 
         if (valid && !load_full_state) {
@@ -1887,7 +1969,9 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
 
         if (valid && load_full_state) {
             const llama_pos restored_pos = llama_kv_cache_seq_pos_max(ctx_, slot.id);
-            const llama_pos expected_pos = restore_tokens > 0 ? (llama_pos) restore_tokens - 1 : -1;
+            const llama_pos expected_pos = restore_tokens > 0
+                ? candidate.tokens.pos_next(restore_tokens) - 1
+                : -1;
             if (restored_pos != expected_pos) {
                 LLAMA_LOG_WARN("disk KV cache full-state position mismatch; falling back to prompt evaluation\n");
                 valid = false;
@@ -1909,12 +1993,28 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
 
         if (!valid) {
             LLAMA_LOG_WARN("disk KV cache entry failed validation; falling back to prompt evaluation\n");
-            llama_kv_cache_seq_rm(ctx_, slot.id, -1, -1);
-            slot.cache_tokens.clear();
-            slot.server_cached_prompt.checkpoints.clear();
-            slot.server_cached_prompt.data.clear();
+            clear_restore();
             return false;
         }
+
+        // Commit every logical view together, before bookkeeping or returning
+        // to slot selection. No deleted suffix may survive a full-truncate.
+        auto restored_tokens = candidate.tokens.clone();
+        restored_tokens.keep_first(restore_tokens);
+        restored_tokens.has_mtmd = has_mtmd;
+        server_prompt restored_prompt{};
+        restored_prompt.tokens = restored_tokens.clone();
+        if (have_restored_checkpoint) {
+            restored_prompt.checkpoints.push_back(std::move(restored_checkpoint));
+        }
+        slot.cache_tokens = std::move(restored_tokens);
+        slot.server_cached_prompt = std::move(restored_prompt);
+        slot.n_past = (int32_t) restore_tokens;
+        slot.n_past_prompt = 0;
+        slot.n_past_se = slot.ga_i = 0;
+        slot.n_kept_prompt = slot.n_discarded_prompt = 0;
+        slot.do_checkpoint = slot.image_just_processed = false;
+        slot.checkpoint_pos = load_full_state ? -1 : candidate.checkpoints[best_checkpoint].pos_max;
 
         candidate.last_used = now_ticks();
         auto meta_tmp = candidate.meta_path;
@@ -1933,26 +2033,11 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
         if (!candidate.checkpoints.empty()) {
             std::filesystem::last_write_time(candidate.checkpoint_path, std::filesystem::file_time_type::clock::now(), ec);
         }
+    } catch (const std::exception & error) {
+        LLAMA_LOG_WARN("disk KV cache restore failed: %s; falling back to prompt evaluation\n", error.what());
+        clear_restore();
+        return false;
     }
-
-    slot.cache_tokens = candidate.tokens.clone();
-    if (!load_full_state) {
-        slot.cache_tokens.resize(restore_tokens);
-    }
-    slot.cache_tokens.has_mtmd = has_mtmd;
-    slot.n_past = (int32_t) restore_tokens;
-    slot.n_past_prompt = 0;
-    slot.n_kept_prompt = candidate.n_kept_prompt;
-    slot.n_discarded_prompt = candidate.n_discarded_prompt;
-    slot.server_cached_prompt.tokens = slot.cache_tokens.clone();
-    slot.server_cached_prompt.n_kept_prompt = candidate.n_kept_prompt;
-    slot.server_cached_prompt.n_discarded_prompt = candidate.n_discarded_prompt;
-    slot.server_cached_prompt.data.clear();
-    slot.server_cached_prompt.checkpoints.clear();
-    if (have_restored_checkpoint) {
-        slot.server_cached_prompt.checkpoints.push_back(std::move(restored_checkpoint));
-    }
-    slot.checkpoint_pos = load_full_state ? -1 : candidate.checkpoints[best_checkpoint].pos_max;
 
     LOG_INFO("disk KV cache hit", {
         {"id_slot", slot.id},
@@ -1965,8 +2050,21 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
     return true;
 }
 
-bool server_disk_kv_cache::save_prompt(server_prompt prompt, bool wait_for_queue) {
-    if (!enabled_ || prompt.tokens.empty() || has_media_tokens(prompt.tokens) || prompt.data.empty()) {
+bool server_disk_kv_cache::save_prompt(server_prompt && prompt, bool wait_for_queue) {
+    if (!enabled_ || prompt.tokens.empty() || prompt.data.empty()) {
+        return false;
+    }
+
+    // Refuse before consuming the RAM entry. The eviction callback retains
+    // that same object when the bounded writer queue cannot accept a spill.
+    std::unique_lock<std::mutex> queue_lock(io_mutex_);
+    if (wait_for_queue) {
+        io_cv_.wait(queue_lock, [this]() {
+            return io_stop_ || pending_saves_.size() < MAX_PENDING_SAVES;
+        });
+    }
+    if (io_stop_ || pending_saves_.size() >= MAX_PENDING_SAVES) {
+        LLAMA_LOG_WARN("disk KV cache spill skipped because the writer queue is unavailable\n");
         return false;
     }
 
@@ -2000,6 +2098,9 @@ bool server_disk_kv_cache::save_prompt(server_prompt prompt, bool wait_for_queue
     const entry * inherited_source = nullptr;
     size_t inherited_lcp = 0;
     for (const auto & candidate : entries_) {
+        if (candidate.n_discarded_prompt != 0 || pending.value.n_discarded_prompt != 0) {
+            continue;
+        }
         const size_t lcp = common_prefix_tokens(candidate.tokens, pending.value.tokens);
         if (lcp > inherited_lcp ||
             (lcp == inherited_lcp && inherited_source != nullptr &&
@@ -2022,16 +2123,6 @@ bool server_disk_kv_cache::save_prompt(server_prompt prompt, bool wait_for_queue
 
     size_t queue_depth = 0;
     {
-        std::unique_lock<std::mutex> lock(io_mutex_);
-        if (wait_for_queue) {
-            io_cv_.wait(lock, [this]() {
-                return io_stop_ || pending_saves_.size() < MAX_PENDING_SAVES;
-            });
-        }
-        if (pending_saves_.size() >= MAX_PENDING_SAVES) {
-            LLAMA_LOG_WARN("disk KV cache spill skipped because the writer queue is full\n");
-            return false;
-        }
         bool replaced = false;
         for (auto & queued : pending_saves_) {
             if (queued.value.stem == pending.value.stem) {
@@ -2045,6 +2136,7 @@ bool server_disk_kv_cache::save_prompt(server_prompt prompt, bool wait_for_queue
         }
         queue_depth = pending_saves_.size();
     }
+    queue_lock.unlock();
     io_cv_.notify_one();
 
     LOG_INFO("disk KV cache snapshot queued", {
@@ -2673,7 +2765,8 @@ server_slot* server_context::get_available_slot(const server_task& task) {
         // restored; a disk hit is then promoted into the live slot and the
         // normal prompt path continues entirely in memory.
         if (!ram_cache_loaded && disk_kv_cache && disk_kv_cache->enabled() &&
-            task.type == SERVER_TASK_TYPE_COMPLETION && !task.tokens.empty()) {
+            task.type == SERVER_TASK_TYPE_COMPLETION && !task.tokens.empty() &&
+            system_tokens.empty() && !task.data.contains("system_prompt")) {
             disk_kv_cache->load_best(*ret, task.tokens, cache_ram_similarity, mctx != nullptr);
         }
     }
@@ -4903,6 +4996,10 @@ void server_context::print_tokens(const server_tokens& prompt, const server_toke
 }
 
 void server_context::discard_n_kv_and_cache_tokens(llama_context* ctx, server_slot& slot, int32_t n_keep, int32_t n_discard) {
+    // Checkpoints describe the pre-shift history and position geometry.
+    // They cannot be inherited by a later unshifted disk entry.
+    slot.server_cached_prompt.checkpoints.clear();
+    slot.checkpoint_pos = -1;
     auto kv_keep = slot.cache_tokens.pos_next(n_keep);
     auto kv_discard = slot.cache_tokens.pos_next(n_keep + n_discard) - kv_keep;
     auto kv_past = slot.cache_tokens.pos_next(slot.n_past);
@@ -5266,14 +5363,15 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 slot.server_cached_prompt.checkpoints.rbegin(),
                 slot.server_cached_prompt.checkpoints.rend(),
                 [&](const auto & cur) {
-                    if (cur.pos_max > pos_next) {
+                    if (cur.pos_max >= pos_next) {
                         return false;
                     }
                     return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                 }
             );
 
-            bool do_reset = it == slot.server_cached_prompt.checkpoints.rend();
+            bool do_reset = it == slot.server_cached_prompt.checkpoints.rend() ||
+                llama_model_is_recurrent(model);
 
             if (!do_reset) {
                 // restore the context checkpoint
@@ -5282,7 +5380,8 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 const bool rewound = !is_openpangu ||
                     llama_kv_cache_seq_rm(slot.ctx, slot.id, it->pos_max + 1, -1);
                 const size_t n = rewound
-                    ? llama_state_seq_set_data(ctx, it->data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)
+                    ? llama_state_seq_set_data(ctx, it->data.data(), checkpoint_size, slot.id,
+                        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_KEEP_KV)
                     : 0;
 
                 if (!rewound) {
@@ -5297,7 +5396,10 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 }
 
                 if (!do_reset) {
-                    pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                    // The checkpoint already evaluated pos_max. Continue at
+                    // pos_max + 1; re-evaluating it would roll recurrent state
+                    // back by one without restoring an earlier checkpoint.
+                    pos_next = it->pos_max + 1;
                     slot.n_past = slot.cache_tokens.size_up_to_pos(pos_next);
                     auto prefix = slot.cache_tokens.get_common_prefix_first_n(ctx, slot.prompt_tokens, slot.n_past);
                     slot.n_past_prompt = prefix.second;
@@ -5309,11 +5411,9 @@ void server_context::apply_checkpoint(server_slot & slot) {
             }
 
             if (do_reset) {
-                if (is_openpangu) {
-                    common_speculative_clear_sequence_kv(slot.spec, ctx, slot.id);
-                    slot.server_cached_prompt.checkpoints.clear();
-                    slot.checkpoint_pos = -1;
-                }
+                common_speculative_clear_sequence_kv(slot.spec, ctx, slot.id);
+                slot.server_cached_prompt = server_prompt{};
+                slot.checkpoint_pos = -1;
                 SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data.%s\n","");
                 slot.n_past = 0;
                 slot.n_past_prompt = 0;
@@ -5330,7 +5430,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
         // erase checkpoints whose data extends at or past the next write position
         for (auto it = slot.server_cached_prompt.checkpoints.begin(); it != slot.server_cached_prompt.checkpoints.end();) {
             const auto & cur = *it;
-            if (cur.pos_max > pos_next) {
+            if (cur.pos_max >= pos_next) {
                 SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, (float)cur.data.size() / 1024 / 1024);
                 it = slot.server_cached_prompt.checkpoints.erase(it);
             } else {
@@ -5386,15 +5486,21 @@ static std::list<server_prompt_checkpoint>::iterator evict_checkpoint_by_varianc
 }
 
 bool server_context::create_checkpoint(server_slot & slot) {
-    bool do_checkpoint = !slot.image_just_processed;
+    bool do_checkpoint = !slot.image_just_processed && params_base.ctx_checkpoints_n > 0;
     int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
     const auto pos_max = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
+    // cache_tokens may already include the rest of a queued batch. Record
+    // only tokens whose positions have actually been evaluated.
+    const llama_pos next = pos_max + 1 - (llama_pos) system_tokens.size();
+    const int64_t n_tokens = next > 0 ? slot.cache_tokens.size_up_to_pos(next) : 0;
+    do_checkpoint = do_checkpoint && slot.ga_n == 1 &&
+        slot.cache_tokens.pos_next(n_tokens) == next;
 
     // no need for empty or small checkpoints
-    do_checkpoint = do_checkpoint && (pos_min >= 0 && slot.cache_tokens.n_tokens() >= 64);
+    do_checkpoint = do_checkpoint && (pos_min >= 0 && n_tokens >= 64);
 
     // no need to create checkpoints that are too close together
-    do_checkpoint = do_checkpoint && (slot.server_cached_prompt.checkpoints.empty() || slot.cache_tokens.n_tokens() > slot.server_cached_prompt.checkpoints.back().n_tokens);
+    do_checkpoint = do_checkpoint && (slot.server_cached_prompt.checkpoints.empty() || n_tokens > slot.server_cached_prompt.checkpoints.back().n_tokens);
 
     if (do_checkpoint) {
         const int64_t t_start = ggml_time_us();
@@ -5412,7 +5518,7 @@ bool server_context::create_checkpoint(server_slot & slot) {
         }
 
         auto & cur = slot.server_cached_prompt.checkpoints.emplace_back();
-        server_prompt_checkpoint_update(cur, ctx, slot.id, slot.cache_tokens.n_tokens(), pos_min, pos_max);
+        server_prompt_checkpoint_update(cur, ctx, slot.id, n_tokens, pos_min, pos_max);
 
         SLT_WRN(slot, "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, took %.2f ms)\n",
             (int)slot.server_cached_prompt.checkpoints.size(), params_base.ctx_checkpoints_n, cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024,
