@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -244,6 +245,10 @@ private:
             int64_t n_tokens = 0;
             uint64_t data_offset = 0;
             uint64_t data_size = 0;
+            // Empty for legacy v1 inline checkpoints. New checkpoints are
+            // stored once in the content-addressed blob store and manifests
+            // keep only this reference.
+            std::string blob_id;
         };
 
         std::string stem;
@@ -262,23 +267,32 @@ private:
         entry value;
         std::vector<uint8_t> state;
         std::vector<server_prompt_checkpoint> checkpoints;
+        std::vector<entry::checkpoint_index> inherited_checkpoints;
     };
 
     struct active_save {
         server_tokens tokens;
+        std::vector<std::string> blob_ids;
     };
 
     static constexpr uint32_t META_MAGIC = 0x3143564b; // "KVC1"
     static constexpr uint32_t META_VERSION = 3;
     static constexpr uint32_t CHECKPOINT_MAGIC = 0x31545043; // "CPT1"
-    static constexpr uint32_t CHECKPOINT_VERSION = 1;
+    static constexpr uint32_t CHECKPOINT_VERSION = 2;
+    static constexpr uint32_t BLOB_MAGIC = 0x3142564b; // "KVB1"
+    static constexpr uint32_t BLOB_VERSION = 1;
+    static constexpr uint32_t BLOB_HASH_VERSION = 1;
 
     llama_context * ctx_ = nullptr;
     std::filesystem::path root_path_;
     std::filesystem::path namespace_path_;
+    std::filesystem::path blobs_path_;
     std::string fingerprint_;
+    uint64_t fingerprint_hash_ = 0;
     uint64_t max_bytes_ = 0;
     uint64_t used_bytes_ = 0;
+    std::map<std::string, uint64_t> blob_sizes_;
+    bool scan_complete_ = false;
     bool enabled_ = false;
     std::vector<entry> entries_;
 
@@ -297,6 +311,15 @@ private:
     static size_t common_prefix_tokens(const server_tokens & a, const server_tokens & b);
 
     std::string stem_for_tokens(const server_tokens & tokens) const;
+    std::string checkpoint_blob_id(
+        llama_pos pos_min,
+        llama_pos pos_max,
+        int64_t n_tokens,
+        const std::vector<uint8_t> & data) const;
+    std::filesystem::path checkpoint_blob_path(const std::string & blob_id) const;
+    bool checkpoint_blob_usable(const entry::checkpoint_index & checkpoint) const;
+    bool write_checkpoint_blob(const server_prompt_checkpoint & checkpoint, std::string & blob_id) const;
+    bool read_checkpoint_blob(const entry::checkpoint_index & checkpoint, std::vector<uint8_t> & data) const;
     void scan();
     bool read_metadata(const std::filesystem::path & path, entry & result) const;
     bool read_checkpoint_index(const std::filesystem::path & path, entry & result) const;
@@ -304,10 +327,12 @@ private:
     bool write_checkpoint_file(
         const std::filesystem::path & path,
         entry & value,
-        const std::vector<server_prompt_checkpoint> & checkpoints) const;
+        const std::vector<server_prompt_checkpoint> & checkpoints,
+        const std::vector<entry::checkpoint_index> & inherited_checkpoints) const;
     bool remove_entry_files(const entry & value);
+    void rebuild_usage();
+    void gc_unreferenced_blobs();
     void evict_if_needed(const std::string & keep_stem = "");
-    bool enforce_root_quota_locked();
     void prune_missing_entries();
     void writer_loop();
     void write_pending_save(pending_save pending);

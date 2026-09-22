@@ -77,28 +77,6 @@ static std::string disk_kv_cache_fingerprint(const gpt_params & params, llama_co
     return out.str();
 }
 
-static bool disk_kv_cache_read_last_used(const std::filesystem::path & path, uint64_t & last_used) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        return false;
-    }
-
-    uint32_t magic = 0;
-    uint32_t version = 0;
-    uint64_t n_tokens = 0;
-    int32_t n_kept_prompt = 0;
-    int32_t n_discarded_prompt = 0;
-
-    file.read(reinterpret_cast<char *>(&magic), sizeof(magic));
-    file.read(reinterpret_cast<char *>(&version), sizeof(version));
-    file.read(reinterpret_cast<char *>(&n_tokens), sizeof(n_tokens));
-    file.read(reinterpret_cast<char *>(&n_kept_prompt), sizeof(n_kept_prompt));
-    file.read(reinterpret_cast<char *>(&n_discarded_prompt), sizeof(n_discarded_prompt));
-    file.read(reinterpret_cast<char *>(&last_used), sizeof(last_used));
-    constexpr uint32_t meta_magic = 0x3143564b; // "KVC1"
-    return file.gcount() == (std::streamsize) sizeof(last_used) && magic == meta_magic && n_tokens != 0;
-}
-
 static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min, llama_pos pos_max) {
     ckpt.pos_min = pos_min;
     ckpt.pos_max = pos_max;
@@ -790,8 +768,10 @@ server_disk_kv_cache::server_disk_kv_cache(
     const std::string namespace_hash = fnv_hash(
         reinterpret_cast<const uint8_t *>(fingerprint_.data()), fingerprint_.size());
     namespace_path_ = root_path_ / ("v2-" + namespace_hash);
+    fingerprint_hash_ = std::stoull(namespace_hash);
+    blobs_path_ = namespace_path_ / "blobs";
 
-    std::filesystem::create_directories(namespace_path_, ec);
+    std::filesystem::create_directories(blobs_path_, ec);
     if (ec || !std::filesystem::is_directory(namespace_path_, ec)) {
         LOG_WARNING("disk KV cache disabled: unable to create cache directory", {
             {"path", namespace_path_.string()},
@@ -801,12 +781,17 @@ server_disk_kv_cache::server_disk_kv_cache(
     }
 
     enabled_ = true;
-    {
-        std::lock_guard<std::mutex> fs_lock(fs_mutex_);
-        enforce_root_quota_locked();
-    }
     scan();
-    evict_if_needed();
+    if (!scan_complete_) {
+        // Never let an incomplete index turn into destructive GC/eviction.
+        // The caller will fall back to the RAM cache for this process; the
+        // files remain intact for a later repair or manual inspection.
+        LLAMA_LOG_WARN("disk KV cache disabled for this run because the on-disk index scan was incomplete\n");
+        enabled_ = false;
+    }
+    else {
+        evict_if_needed();
+    }
     io_thread_ = std::thread(&server_disk_kv_cache::writer_loop, this);
 
     LOG_INFO("disk KV cache enabled", {
@@ -842,6 +827,220 @@ std::string server_disk_kv_cache::stem_for_tokens(const server_tokens & tokens) 
         std::memcpy(key.data() + sizeof(n_tokens) + i * sizeof(llama_token), &tokens[i], sizeof(llama_token));
     }
     return "prefix-" + fnv_hash(key.data(), key.size());
+}
+
+std::string server_disk_kv_cache::checkpoint_blob_id(
+        llama_pos pos_min,
+        llama_pos pos_max,
+        int64_t n_tokens,
+        const std::vector<uint8_t> & data) const {
+    // The namespace already contains the complete runtime fingerprint, but
+    // include it and the serialization/version fields in the content key as
+    // well.  The second independent FNV stream makes accidental collisions
+    // vanishingly unlikely without adding a heavyweight crypto dependency to
+    // the server binary.  The actual state bytes are part of both streams.
+    std::vector<uint8_t> key;
+    key.reserve(fingerprint_.size() + sizeof(BLOB_HASH_VERSION) + sizeof(pos_min) +
+        sizeof(pos_max) + sizeof(n_tokens) + data.size());
+    const auto append = [&key](const void * ptr, size_t size) {
+        const auto * bytes = reinterpret_cast<const uint8_t *>(ptr);
+        key.insert(key.end(), bytes, bytes + size);
+    };
+    append(&BLOB_HASH_VERSION, sizeof(BLOB_HASH_VERSION));
+    append(fingerprint_.data(), fingerprint_.size());
+    append(&pos_min, sizeof(pos_min));
+    append(&pos_max, sizeof(pos_max));
+    append(&n_tokens, sizeof(n_tokens));
+    append(data.data(), data.size());
+
+    const std::string primary = fnv_hash(key.data(), key.size());
+    std::vector<uint8_t> secondary_key;
+    secondary_key.reserve(sizeof(BLOB_HASH_VERSION) + key.size());
+    const uint32_t secondary_version = BLOB_HASH_VERSION ^ 0x9e3779b9u;
+    const auto append_secondary = [&secondary_key](const void * ptr, size_t size) {
+        const auto * bytes = reinterpret_cast<const uint8_t *>(ptr);
+        secondary_key.insert(secondary_key.end(), bytes, bytes + size);
+    };
+    append_secondary(&secondary_version, sizeof(secondary_version));
+    append_secondary(key.data(), key.size());
+    return "blob-" + primary + "-" + fnv_hash(secondary_key.data(), secondary_key.size());
+}
+
+std::filesystem::path server_disk_kv_cache::checkpoint_blob_path(const std::string & blob_id) const {
+    return blobs_path_ / (blob_id + ".bin");
+}
+
+bool server_disk_kv_cache::checkpoint_blob_usable(const entry::checkpoint_index & checkpoint) const {
+    if (checkpoint.blob_id.empty() || checkpoint.data_size == 0) {
+        return false;
+    }
+
+    const auto path = checkpoint_blob_path(checkpoint.blob_id);
+    std::error_code ec;
+    const uintmax_t file_size = std::filesystem::file_size(path, ec);
+    const uintmax_t minimum_header_size = sizeof(uint32_t) * 2 + sizeof(uint64_t) +
+        sizeof(llama_pos) * 2 + sizeof(int64_t) + sizeof(uint64_t);
+    if (ec || file_size < minimum_header_size || file_size < checkpoint.data_size ||
+        file_size - checkpoint.data_size < minimum_header_size) {
+        return false;
+    }
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint64_t fingerprint_hash = 0;
+    llama_pos pos_min = 0;
+    llama_pos pos_max = 0;
+    int64_t n_tokens = 0;
+    uint64_t data_size = 0;
+    file.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char *>(&version), sizeof(version));
+    file.read(reinterpret_cast<char *>(&fingerprint_hash), sizeof(fingerprint_hash));
+    file.read(reinterpret_cast<char *>(&pos_min), sizeof(pos_min));
+    file.read(reinterpret_cast<char *>(&pos_max), sizeof(pos_max));
+    file.read(reinterpret_cast<char *>(&n_tokens), sizeof(n_tokens));
+    file.read(reinterpret_cast<char *>(&data_size), sizeof(data_size));
+    if (!file || magic != BLOB_MAGIC || version != BLOB_VERSION ||
+        fingerprint_hash != fingerprint_hash_ || pos_min != checkpoint.pos_min ||
+        pos_max != checkpoint.pos_max || n_tokens != checkpoint.n_tokens ||
+        data_size != checkpoint.data_size) {
+        return false;
+    }
+
+    const uintmax_t header_size = (uintmax_t) file.tellg();
+    return header_size <= file_size && data_size == file_size - header_size;
+}
+
+bool server_disk_kv_cache::write_checkpoint_blob(
+        const server_prompt_checkpoint & checkpoint,
+        std::string & blob_id) const {
+    if (checkpoint.n_tokens <= 0 || checkpoint.data.empty()) {
+        return false;
+    }
+
+    const std::string base_id = checkpoint_blob_id(
+        checkpoint.pos_min, checkpoint.pos_max, checkpoint.n_tokens, checkpoint.data);
+    std::error_code ec;
+    std::filesystem::create_directories(blobs_path_, ec);
+    if (ec) {
+        return false;
+    }
+
+    for (uint32_t collision = 0; collision < 1024; ++collision) {
+        blob_id = base_id;
+        if (collision != 0) {
+            blob_id += "-c" + std::to_string(collision);
+        }
+
+        const auto path = checkpoint_blob_path(blob_id);
+        if (std::filesystem::is_regular_file(path, ec)) {
+            ec.clear();
+            entry::checkpoint_index existing;
+            existing.pos_min = checkpoint.pos_min;
+            existing.pos_max = checkpoint.pos_max;
+            existing.n_tokens = checkpoint.n_tokens;
+            existing.data_size = checkpoint.data.size();
+            existing.blob_id = blob_id;
+            if (checkpoint_blob_usable(existing)) {
+                return true;
+            }
+            continue;
+        }
+        ec.clear();
+
+        const auto tmp = path.string() + ".tmp-" + std::to_string(now_ticks()) +
+            "-" + std::to_string(reinterpret_cast<uintptr_t>(this));
+        std::filesystem::remove(tmp, ec);
+        ec.clear();
+        {
+            std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+            if (!file) {
+                return false;
+            }
+            const uint32_t magic = BLOB_MAGIC;
+            const uint32_t version = BLOB_VERSION;
+            const uint64_t data_size = checkpoint.data.size();
+            file.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+            file.write(reinterpret_cast<const char *>(&version), sizeof(version));
+            file.write(reinterpret_cast<const char *>(&fingerprint_hash_), sizeof(fingerprint_hash_));
+            file.write(reinterpret_cast<const char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
+            file.write(reinterpret_cast<const char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
+            file.write(reinterpret_cast<const char *>(&checkpoint.n_tokens), sizeof(checkpoint.n_tokens));
+            file.write(reinterpret_cast<const char *>(&data_size), sizeof(data_size));
+            file.write(reinterpret_cast<const char *>(checkpoint.data.data()), (std::streamsize) data_size);
+            file.flush();
+            if (!file.good()) {
+                std::filesystem::remove(tmp, ec);
+                return false;
+            }
+        }
+
+        std::filesystem::rename(tmp, path, ec);
+        if (!ec) {
+            return true;
+        }
+
+        // Another writer may have won the race between the existence check
+        // and rename.  Never overwrite its complete blob; validate and reuse
+        // it instead.  A malformed/colliding file gets a deterministic suffix
+        // on the next loop iteration.
+        std::filesystem::remove(tmp, ec);
+        ec.clear();
+        entry::checkpoint_index existing;
+        existing.pos_min = checkpoint.pos_min;
+        existing.pos_max = checkpoint.pos_max;
+        existing.n_tokens = checkpoint.n_tokens;
+        existing.data_size = checkpoint.data.size();
+        existing.blob_id = blob_id;
+        if (checkpoint_blob_usable(existing)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool server_disk_kv_cache::read_checkpoint_blob(
+        const entry::checkpoint_index & checkpoint,
+        std::vector<uint8_t> & data) const {
+    if (!checkpoint_blob_usable(checkpoint)) {
+        return false;
+    }
+
+    const auto path = checkpoint_blob_path(checkpoint.blob_id);
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    constexpr size_t header_size = sizeof(uint32_t) * 2 + sizeof(uint64_t) +
+        sizeof(llama_pos) * 2 + sizeof(int64_t) + sizeof(uint64_t);
+    file.seekg((std::streamoff) header_size, std::ios::beg);
+    if (!file) {
+        return false;
+    }
+    data.resize((size_t) checkpoint.data_size);
+    file.read(reinterpret_cast<char *>(data.data()), (std::streamsize) data.size());
+    if (file.gcount() != (std::streamsize) data.size()) {
+        return false;
+    }
+
+    // The blob name is content-addressed, not merely a filename.  Validate
+    // the payload on read so a truncated or modified file cannot be accepted
+    // just because its header and length still look plausible.  A collision
+    // suffix is allowed only for the deterministic fallback used when a
+    // malformed file occupied the base name.
+    const std::string expected_id = checkpoint_blob_id(
+        checkpoint.pos_min, checkpoint.pos_max, checkpoint.n_tokens, data);
+    if (checkpoint.blob_id != expected_id &&
+        checkpoint.blob_id.rfind(expected_id + "-c", 0) != 0) {
+        return false;
+    }
+    return true;
 }
 
 bool server_disk_kv_cache::read_metadata(const std::filesystem::path & path, entry & result) const {
@@ -902,7 +1101,9 @@ bool server_disk_kv_cache::read_checkpoint_index(const std::filesystem::path & p
     file.read(reinterpret_cast<char *>(&n_checkpoints), sizeof(n_checkpoints));
 
     // A corrupt sidecar must not make the complete state entry unusable.
-    if (!file || magic != CHECKPOINT_MAGIC || version != CHECKPOINT_VERSION ||
+    // Version 1 stored checkpoint bytes inline; version 2 is a manifest of
+    // references into the shared content-addressed blob directory.
+    if (!file || magic != CHECKPOINT_MAGIC || (version != 1 && version != CHECKPOINT_VERSION) ||
         n_checkpoints == 0 || n_checkpoints > 4096) {
         return false;
     }
@@ -926,15 +1127,31 @@ bool server_disk_kv_cache::read_checkpoint_index(const std::filesystem::path & p
             return false;
         }
 
-        const std::streampos data_offset = file.tellg();
-        if (data_offset < 0 || (uintmax_t) data_offset > file_size ||
-            index.data_size > file_size - (uintmax_t) data_offset) {
-            return false;
+        if (version == 1) {
+            const std::streampos data_offset = file.tellg();
+            if (data_offset < 0 || (uintmax_t) data_offset > file_size ||
+                index.data_size > file_size - (uintmax_t) data_offset) {
+                return false;
+            }
+            index.data_offset = (uint64_t) data_offset;
+            file.seekg((std::streamoff) index.data_size, std::ios::cur);
+            if (!file) {
+                return false;
+            }
         }
-        index.data_offset = (uint64_t) data_offset;
-        file.seekg((std::streamoff) index.data_size, std::ios::cur);
-        if (!file) {
-            return false;
+        else {
+            uint32_t blob_name_size = 0;
+            file.read(reinterpret_cast<char *>(&blob_name_size), sizeof(blob_name_size));
+            if (!file || blob_name_size == 0 || blob_name_size > 1024) {
+                return false;
+            }
+            index.blob_id.resize(blob_name_size);
+            file.read(index.blob_id.data(), blob_name_size);
+            if (!file || index.blob_id.find_first_of("\\/") != std::string::npos ||
+                index.blob_id == "." || index.blob_id == "..") {
+                return false;
+            }
+            index.data_offset = 0;
         }
         checkpoints.push_back(index);
     }
@@ -972,17 +1189,45 @@ bool server_disk_kv_cache::write_metadata(const std::filesystem::path & path, co
 bool server_disk_kv_cache::write_checkpoint_file(
         const std::filesystem::path & path,
         entry & value,
-        const std::vector<server_prompt_checkpoint> & checkpoints) const {
-    std::vector<const server_prompt_checkpoint *> valid;
-    valid.reserve(checkpoints.size());
+        const std::vector<server_prompt_checkpoint> & checkpoints,
+        const std::vector<entry::checkpoint_index> & inherited_checkpoints) const {
+    std::map<int64_t, entry::checkpoint_index> merged;
+    for (const auto & checkpoint : inherited_checkpoints) {
+        if (checkpoint.n_tokens > 0 && checkpoint.n_tokens <= (int64_t) value.tokens.size() &&
+            !checkpoint.blob_id.empty() && checkpoint_blob_usable(checkpoint)) {
+            merged[checkpoint.n_tokens] = checkpoint;
+        }
+    }
+
     for (const auto & checkpoint : checkpoints) {
         if (checkpoint.n_tokens > 0 && checkpoint.n_tokens <= (int64_t) value.tokens.size() &&
             !checkpoint.data.empty()) {
-            valid.push_back(&checkpoint);
+            std::string blob_id;
+            if (!write_checkpoint_blob(checkpoint, blob_id)) {
+                LLAMA_LOG_WARN("disk KV cache save failed while writing a checkpoint blob\n");
+                return false;
+            }
+            entry::checkpoint_index index;
+            index.pos_min = checkpoint.pos_min;
+            index.pos_max = checkpoint.pos_max;
+            index.n_tokens = checkpoint.n_tokens;
+            index.data_size = checkpoint.data.size();
+            index.blob_id = std::move(blob_id);
+            // A newly captured checkpoint is authoritative if a restored
+            // inherited reference has the same position.
+            merged[index.n_tokens] = std::move(index);
         }
     }
-    if (valid.empty() || valid.size() > std::numeric_limits<uint32_t>::max()) {
+
+    if (merged.empty() || merged.size() > std::numeric_limits<uint32_t>::max()) {
         return false;
+    }
+
+    std::vector<entry::checkpoint_index> valid;
+    valid.reserve(merged.size());
+    for (auto & [n_tokens, checkpoint] : merged) {
+        (void) n_tokens;
+        valid.push_back(std::move(checkpoint));
     }
 
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
@@ -999,83 +1244,257 @@ bool server_disk_kv_cache::write_checkpoint_file(
 
     value.checkpoints.clear();
     value.checkpoints.reserve(valid.size());
-    for (const auto * checkpoint : valid) {
-        const uint64_t data_size = checkpoint->data.size();
-        file.write(reinterpret_cast<const char *>(&checkpoint->pos_min), sizeof(checkpoint->pos_min));
-        file.write(reinterpret_cast<const char *>(&checkpoint->pos_max), sizeof(checkpoint->pos_max));
-        file.write(reinterpret_cast<const char *>(&checkpoint->n_tokens), sizeof(checkpoint->n_tokens));
+    for (const auto & checkpoint : valid) {
+        const uint64_t data_size = checkpoint.data_size;
+        const uint32_t blob_name_size = (uint32_t) checkpoint.blob_id.size();
+        file.write(reinterpret_cast<const char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
+        file.write(reinterpret_cast<const char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
+        file.write(reinterpret_cast<const char *>(&checkpoint.n_tokens), sizeof(checkpoint.n_tokens));
         file.write(reinterpret_cast<const char *>(&data_size), sizeof(data_size));
-
-        const std::streampos data_offset = file.tellp();
-        if (data_offset < 0) {
-            return false;
-        }
-        file.write(reinterpret_cast<const char *>(checkpoint->data.data()), (std::streamsize) data_size);
+        file.write(reinterpret_cast<const char *>(&blob_name_size), sizeof(blob_name_size));
+        file.write(checkpoint.blob_id.data(), (std::streamsize) checkpoint.blob_id.size());
         if (!file) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
             return false;
         }
 
-        entry::checkpoint_index index;
-        index.pos_min = checkpoint->pos_min;
-        index.pos_max = checkpoint->pos_max;
-        index.n_tokens = checkpoint->n_tokens;
-        index.data_offset = (uint64_t) data_offset;
-        index.data_size = data_size;
-        value.checkpoints.push_back(index);
+        value.checkpoints.push_back(checkpoint);
     }
 
     file.flush();
-    return file.good();
+    if (!file.good()) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        return false;
+    }
+    return true;
 }
 
 void server_disk_kv_cache::scan() {
     entries_.clear();
     used_bytes_ = 0;
+    blob_sizes_.clear();
+    scan_complete_ = false;
 
+    std::vector<std::filesystem::path> meta_paths;
     std::error_code ec;
-    for (const auto & item : std::filesystem::directory_iterator(namespace_path_, ec)) {
+    std::filesystem::directory_iterator it(namespace_path_, ec);
+    if (ec) {
+        LLAMA_LOG_WARN("disk KV cache scan failed while opening namespace directory\n");
+        return;
+    }
+    const std::filesystem::directory_iterator end;
+    for (; it != end; it.increment(ec)) {
         if (ec) {
-            break;
+            LLAMA_LOG_WARN("disk KV cache scan failed while enumerating namespace directory\n");
+            return;
         }
-        if (!item.is_regular_file(ec) || item.path().extension() != ".meta") {
+        std::error_code item_ec;
+        if (!it->is_regular_file(item_ec)) {
+            if (item_ec) {
+                LLAMA_LOG_WARN("disk KV cache scan failed while inspecting a namespace entry\n");
+                return;
+            }
             continue;
         }
+        if (it->path().extension() == ".meta") {
+            meta_paths.push_back(it->path());
+        }
+    }
 
+    bool complete = true;
+    const auto report_scan_failure = [](const std::filesystem::path & path, const char * stage, const std::error_code & error = {}) {
+        LOG_WARNING("disk KV cache scan rejected an on-disk item", {
+            {"path", path.string()},
+            {"stage", stage},
+            {"error", error ? error.message() : ""},
+        });
+    };
+    for (const auto & meta_path : meta_paths) {
         entry value;
-        if (!read_metadata(item.path(), value) || !std::filesystem::is_regular_file(value.state_path, ec)) {
+        std::error_code state_ec;
+        if (!read_metadata(meta_path, value) || !std::filesystem::is_regular_file(value.state_path, state_ec)) {
+            report_scan_failure(meta_path, "metadata_or_state", state_ec);
+            complete = false;
             continue;
         }
 
-        ec.clear();
-        if (std::filesystem::is_regular_file(value.checkpoint_path, ec)) {
+        std::error_code checkpoint_ec;
+        const bool has_checkpoint_file = std::filesystem::is_regular_file(value.checkpoint_path, checkpoint_ec);
+        // A short prompt entry legitimately has no checkpoint sidecar.  On
+        // Windows, MSVC's filesystem implementation may report the missing
+        // optional file as ERROR_FILE_NOT_FOUND instead of leaving ec clear.
+        // Do not turn that normal state into an incomplete whole-cache scan.
+        if (checkpoint_ec == std::errc::no_such_file_or_directory) {
+            checkpoint_ec.clear();
+        }
+        if (checkpoint_ec) {
+            report_scan_failure(value.checkpoint_path, "checkpoint_stat", checkpoint_ec);
+            complete = false;
+            continue;
+        }
+        if (has_checkpoint_file) {
             if (!read_checkpoint_index(value.checkpoint_path, value)) {
-                value.checkpoints.clear();
+                report_scan_failure(value.checkpoint_path, "checkpoint_index");
+                complete = false;
+                continue;
             }
         }
 
-        const uintmax_t state_size = std::filesystem::file_size(value.state_path, ec);
-        if (ec) {
-            ec.clear();
+        std::error_code size_ec;
+        const uintmax_t state_size = std::filesystem::file_size(value.state_path, size_ec);
+        if (size_ec) {
+            report_scan_failure(value.state_path, "state_size", size_ec);
+            complete = false;
             continue;
         }
-        const uintmax_t meta_size = std::filesystem::file_size(value.meta_path, ec);
-        if (ec) {
-            ec.clear();
+        const uintmax_t meta_size = std::filesystem::file_size(value.meta_path, size_ec);
+        if (size_ec) {
+            report_scan_failure(value.meta_path, "metadata_size", size_ec);
+            complete = false;
             continue;
         }
 
+        // A manifest can outlive a blob after an interrupted cleanup.  Keep
+        // the complete entry usable, but never select a checkpoint whose
+        // referenced blob is absent or malformed.
+        value.checkpoints.erase(std::remove_if(value.checkpoints.begin(), value.checkpoints.end(),
+            [this](const entry::checkpoint_index & checkpoint) {
+                return !checkpoint.blob_id.empty() && !checkpoint_blob_usable(checkpoint);
+        }), value.checkpoints.end());
+
         uint64_t checkpoint_size = 0;
-        if (!value.checkpoints.empty()) {
-            checkpoint_size = (uint64_t) std::filesystem::file_size(value.checkpoint_path, ec);
-            if (ec) {
-                ec.clear();
-                checkpoint_size = 0;
+        if (has_checkpoint_file) {
+            checkpoint_size = (uint64_t) std::filesystem::file_size(value.checkpoint_path, size_ec);
+            if (size_ec) {
+                report_scan_failure(value.checkpoint_path, "checkpoint_size", size_ec);
+                complete = false;
+                continue;
             }
         }
 
         value.size_bytes = (uint64_t) state_size + (uint64_t) meta_size + checkpoint_size;
         entries_.push_back(std::move(value));
         used_bytes_ += entries_.back().size_bytes;
+    }
+
+    if (!complete || meta_paths.size() != entries_.size()) {
+        if (meta_paths.size() != entries_.size()) {
+            LLAMA_LOG_WARN("disk KV cache scan rejected one or more metadata entries\n");
+        }
+        LLAMA_LOG_WARN("disk KV cache scan was incomplete; preserving files and skipping GC/eviction\n");
+        return;
+    }
+
+    scan_complete_ = true;
+    gc_unreferenced_blobs();
+    rebuild_usage();
+}
+
+void server_disk_kv_cache::rebuild_usage() {
+    used_bytes_ = 0;
+    blob_sizes_.clear();
+
+    for (const auto & value : entries_) {
+        used_bytes_ += value.size_bytes;
+        for (const auto & checkpoint : value.checkpoints) {
+            if (checkpoint.blob_id.empty()) {
+                continue;
+            }
+            std::error_code ec;
+            const uintmax_t size = std::filesystem::file_size(
+                checkpoint_blob_path(checkpoint.blob_id), ec);
+            if (!ec) {
+                blob_sizes_.emplace(checkpoint.blob_id, (uint64_t) size);
+            }
+        }
+    }
+
+    for (const auto & [blob_id, size] : blob_sizes_) {
+        (void) blob_id;
+        used_bytes_ += size;
+    }
+}
+
+void server_disk_kv_cache::gc_unreferenced_blobs() {
+    std::set<std::string> referenced;
+    for (const auto & value : entries_) {
+        for (const auto & checkpoint : value.checkpoints) {
+            if (!checkpoint.blob_id.empty()) {
+                referenced.insert(checkpoint.blob_id);
+            }
+        }
+    }
+
+    // Do not collect a blob which is still in flight.  The manifest is
+    // committed after all blobs are written, so pending/active/completed
+    // snapshots must participate in the temporary reachability set too.
+    bool io_busy = false;
+    {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        io_busy = !pending_saves_.empty() || !active_saves_.empty();
+        for (const auto & pending : pending_saves_) {
+            for (const auto & checkpoint : pending.inherited_checkpoints) {
+                if (!checkpoint.blob_id.empty()) {
+                    referenced.insert(checkpoint.blob_id);
+                }
+            }
+            for (const auto & checkpoint : pending.checkpoints) {
+                if (checkpoint.n_tokens > 0 && !checkpoint.data.empty()) {
+                    referenced.insert(checkpoint_blob_id(
+                        checkpoint.pos_min, checkpoint.pos_max, checkpoint.n_tokens, checkpoint.data));
+                }
+            }
+        }
+        for (const auto & active : active_saves_) {
+            referenced.insert(active.blob_ids.begin(), active.blob_ids.end());
+        }
+        for (const auto & value : completed_saves_) {
+            for (const auto & checkpoint : value.checkpoints) {
+                if (!checkpoint.blob_id.empty()) {
+                    referenced.insert(checkpoint.blob_id);
+                }
+            }
+        }
+    }
+
+    std::error_code ec;
+    uint64_t removed = 0;
+    for (const auto & item : std::filesystem::directory_iterator(blobs_path_, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!item.is_regular_file(ec)) {
+            ec.clear();
+            continue;
+        }
+
+        const auto filename = item.path().filename().string();
+        const auto extension = item.path().extension().string();
+        if (extension == ".bin") {
+            const std::string blob_id = item.path().stem().string();
+            if (referenced.count(blob_id) != 0) {
+                continue;
+            }
+            const uintmax_t size = std::filesystem::file_size(item.path(), ec);
+            ec.clear();
+            std::filesystem::remove(item.path(), ec);
+            if (!ec) {
+                removed += (uint64_t) size;
+            }
+        }
+        else if ((extension == ".tmp" || filename.find(".bin.tmp-") != std::string::npos) && !io_busy) {
+            std::filesystem::remove(item.path(), ec);
+            ec.clear();
+        }
+    }
+
+    if (removed != 0) {
+        LOG_INFO("disk KV cache blob GC", {
+            {"removed_bytes", removed},
+            {"referenced_blobs", referenced.size()},
+        });
     }
 }
 
@@ -1092,10 +1511,17 @@ bool server_disk_kv_cache::remove_entry_files(const entry & value) {
     const bool state_removed = remove_one(value.state_path);
     const bool meta_removed = remove_one(value.meta_path);
     const bool checkpoint_removed = remove_one(value.checkpoint_path);
+    // Blob lifetime is independent from the entry files.  Leave blobs in
+    // place here and let reachability GC remove only those no longer
+    // referenced by any remaining entry (or an in-flight save).
     return state_removed && meta_removed && checkpoint_removed;
 }
 
 void server_disk_kv_cache::evict_if_needed(const std::string & keep_stem) {
+    if (!scan_complete_) {
+        return;
+    }
+    std::lock_guard<std::mutex> fs_lock(fs_mutex_);
     while (used_bytes_ > max_bytes_ && !entries_.empty()) {
         size_t victim = std::numeric_limits<size_t>::max();
         for (size_t i = 0; i < entries_.size(); ++i) {
@@ -1121,6 +1547,8 @@ void server_disk_kv_cache::evict_if_needed(const std::string & keep_stem) {
         }
         used_bytes_ = used_bytes_ >= victim_size ? used_bytes_ - victim_size : 0;
         entries_.erase(entries_.begin() + victim);
+        gc_unreferenced_blobs();
+        rebuild_usage();
 
         LOG_INFO("disk KV cache eviction", {
             {"entry", victim_stem},
@@ -1128,136 +1556,6 @@ void server_disk_kv_cache::evict_if_needed(const std::string & keep_stem) {
             {"limit_bytes", max_bytes_},
         });
     }
-}
-
-bool server_disk_kv_cache::enforce_root_quota_locked() {
-    struct root_entry {
-        std::vector<std::filesystem::path> files;
-        uint64_t size_bytes = 0;
-        uint64_t last_used = 0;
-    };
-
-    // Count complete entries as pairs, but also count stale .tmp files and
-    // orphaned .meta/.state files. They are not loadable, yet they still
-    // consume the user's disk quota.
-    std::vector<std::filesystem::path> files;
-    std::error_code ec;
-    for (std::filesystem::recursive_directory_iterator it(root_path_, ec), end; it != end && !ec; it.increment(ec)) {
-        if (!it->is_regular_file(ec)) {
-            ec.clear();
-            continue;
-        }
-        const auto namespace_name = it->path().parent_path().filename().string();
-        const auto extension = it->path().extension().string();
-        if (namespace_name.rfind("v", 0) == 0 &&
-            (extension == ".meta" || extension == ".state" || extension == ".ckpt" || extension == ".tmp")) {
-            files.push_back(it->path());
-        }
-    }
-
-    const std::set<std::filesystem::path> file_set(files.begin(), files.end());
-    std::set<std::filesystem::path> accounted;
-    std::vector<root_entry> candidates;
-    uint64_t total_bytes = 0;
-    const auto file_time_ticks = [](const std::filesystem::path & path) {
-        std::error_code time_ec;
-        const auto file_time = std::filesystem::last_write_time(path, time_ec);
-        return time_ec ? uint64_t(0) : (uint64_t) file_time.time_since_epoch().count();
-    };
-    const auto add_candidate = [&](std::vector<std::filesystem::path> candidate_files, uint64_t last_used) {
-        uint64_t size_bytes = 0;
-        for (const auto & path : candidate_files) {
-            std::error_code size_ec;
-            const uintmax_t size = std::filesystem::file_size(path, size_ec);
-            if (size_ec) {
-                return;
-            }
-            size_bytes += (uint64_t) size;
-        }
-        for (const auto & path : candidate_files) {
-            accounted.insert(path);
-        }
-        candidates.push_back({std::move(candidate_files), size_bytes, last_used});
-        total_bytes += size_bytes;
-    };
-
-    for (const auto & meta_path : files) {
-        if (meta_path.extension() != ".meta" || accounted.count(meta_path) != 0) {
-            continue;
-        }
-
-        auto state_path = meta_path;
-        state_path.replace_extension(".state");
-        auto checkpoint_path = meta_path;
-        checkpoint_path.replace_extension(".ckpt");
-        std::vector<std::filesystem::path> entry_files = { meta_path };
-        if (file_set.count(state_path) != 0 && accounted.count(state_path) == 0) {
-            entry_files.push_back(state_path);
-        }
-        if (file_set.count(checkpoint_path) != 0 && accounted.count(checkpoint_path) == 0) {
-            entry_files.push_back(checkpoint_path);
-        }
-        if (entry_files.size() > 1) {
-            uint64_t last_used = 0;
-            if (!disk_kv_cache_read_last_used(meta_path, last_used) || last_used == 0) {
-                last_used = file_time_ticks(meta_path);
-            }
-            add_candidate(std::move(entry_files), last_used);
-        }
-        else {
-            add_candidate(std::move(entry_files), file_time_ticks(meta_path));
-        }
-    }
-
-    for (const auto & path : files) {
-        if (accounted.count(path) == 0) {
-            add_candidate({path}, file_time_ticks(path));
-        }
-    }
-
-    if (total_bytes <= max_bytes_) {
-        return false;
-    }
-
-    std::sort(candidates.begin(), candidates.end(), [](const root_entry & a, const root_entry & b) {
-        return a.last_used < b.last_used;
-    });
-
-    bool changed = false;
-    for (const auto & victim : candidates) {
-        if (total_bytes <= max_bytes_) {
-            break;
-        }
-
-        uint64_t removed_bytes = 0;
-        bool removal_failed = false;
-        for (const auto & path : victim.files) {
-            std::error_code size_ec;
-            const uintmax_t size = std::filesystem::file_size(path, size_ec);
-            std::error_code remove_ec;
-            std::filesystem::remove(path, remove_ec);
-            if (remove_ec || std::filesystem::exists(path, remove_ec)) {
-                removal_failed = true;
-                continue;
-            }
-            removed_bytes += size_ec ? 0 : (uint64_t) size;
-        }
-        total_bytes = total_bytes >= removed_bytes ? total_bytes - removed_bytes : 0;
-        changed = changed || removed_bytes != 0;
-
-        LOG_INFO("disk KV cache root eviction", {
-            {"entry", victim.files.front().stem().string()},
-            {"used_bytes", total_bytes},
-            {"limit_bytes", max_bytes_},
-        });
-        if (removal_failed) {
-            LLAMA_LOG_WARN("disk KV cache root eviction could not remove every stale file\n");
-        }
-    }
-    if (total_bytes > max_bytes_) {
-        LLAMA_LOG_WARN("disk KV cache remains over quota because some files could not be removed\n");
-    }
-    return changed;
 }
 
 void server_disk_kv_cache::prune_missing_entries() {
@@ -1276,6 +1574,14 @@ void server_disk_kv_cache::prune_missing_entries() {
             : 0;
         entries_.erase(entries_.begin() + i);
     }
+
+    for (auto & value : entries_) {
+        value.checkpoints.erase(std::remove_if(value.checkpoints.begin(), value.checkpoints.end(),
+            [this](const entry::checkpoint_index & checkpoint) {
+                return !checkpoint.blob_id.empty() && !checkpoint_blob_usable(checkpoint);
+            }), value.checkpoints.end());
+    }
+    rebuild_usage();
 }
 
 void server_disk_kv_cache::drain_completed_saves() {
@@ -1285,21 +1591,22 @@ void server_disk_kv_cache::drain_completed_saves() {
         completed.swap(completed_saves_);
     }
 
-    for (auto & value : completed) {
-        for (size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i].stem == value.stem) {
-                used_bytes_ = used_bytes_ >= entries_[i].size_bytes
-                    ? used_bytes_ - entries_[i].size_bytes
-                    : 0;
-                entries_.erase(entries_.begin() + i);
-                break;
+    {
+        std::lock_guard<std::mutex> fs_lock(fs_mutex_);
+        for (auto & value : completed) {
+            for (size_t i = 0; i < entries_.size(); ++i) {
+                if (entries_[i].stem == value.stem) {
+                    entries_.erase(entries_.begin() + i);
+                    break;
+                }
             }
+            entries_.push_back(std::move(value));
         }
-        used_bytes_ += value.size_bytes;
-        entries_.push_back(std::move(value));
-    }
 
-    prune_missing_entries();
+        prune_missing_entries();
+        gc_unreferenced_blobs();
+        rebuild_usage();
+    }
     if (!completed.empty()) {
         evict_if_needed();
     }
@@ -1451,6 +1758,8 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
     const size_t restore_tokens = load_full_state
         ? candidate.tokens.size()
         : (size_t) candidate.checkpoints[best_checkpoint].n_tokens;
+    server_prompt_checkpoint restored_checkpoint{};
+    bool have_restored_checkpoint = false;
     {
         std::lock_guard<std::mutex> fs_lock(fs_mutex_);
         bool valid = false;
@@ -1468,12 +1777,17 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
             }
         } else {
             const auto & checkpoint = candidate.checkpoints[best_checkpoint];
-            std::ifstream file(candidate.checkpoint_path, std::ios::binary);
-            if (file && checkpoint.data_size > 0 && checkpoint.data_size <= std::numeric_limits<size_t>::max()) {
-                file.seekg((std::streamoff) checkpoint.data_offset, std::ios::beg);
-                state.resize((size_t) checkpoint.data_size);
-                file.read(reinterpret_cast<char *>(state.data()), (std::streamsize) state.size());
-                valid = file.gcount() == (std::streamsize) state.size();
+            if (!checkpoint.blob_id.empty()) {
+                valid = read_checkpoint_blob(checkpoint, state);
+            }
+            else {
+                std::ifstream file(candidate.checkpoint_path, std::ios::binary);
+                if (file && checkpoint.data_size > 0 && checkpoint.data_size <= std::numeric_limits<size_t>::max()) {
+                    file.seekg((std::streamoff) checkpoint.data_offset, std::ios::beg);
+                    state.resize((size_t) checkpoint.data_size);
+                    file.read(reinterpret_cast<char *>(state.data()), (std::streamsize) state.size());
+                    valid = file.gcount() == (std::streamsize) state.size();
+                }
             }
         }
 
@@ -1496,6 +1810,19 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
                 LLAMA_LOG_WARN("disk KV cache checkpoint position mismatch; falling back to prompt evaluation\n");
                 valid = false;
             }
+        }
+
+        if (valid && !load_full_state) {
+            // Keep the checkpoint that was actually restored attached to the
+            // live prompt.  If this agent is later evicted, its manifest must
+            // retain a self-contained recovery point instead of relying on
+            // the older candidate entry remaining in the cache.
+            const auto & checkpoint = candidate.checkpoints[best_checkpoint];
+            restored_checkpoint.pos_min = checkpoint.pos_min;
+            restored_checkpoint.pos_max = checkpoint.pos_max;
+            restored_checkpoint.n_tokens = checkpoint.n_tokens;
+            restored_checkpoint.data = std::move(state);
+            have_restored_checkpoint = true;
         }
 
         if (!valid) {
@@ -1540,6 +1867,9 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
     slot.server_cached_prompt.n_discarded_prompt = candidate.n_discarded_prompt;
     slot.server_cached_prompt.data.clear();
     slot.server_cached_prompt.checkpoints.clear();
+    if (have_restored_checkpoint) {
+        slot.server_cached_prompt.checkpoints.push_back(std::move(restored_checkpoint));
+    }
     slot.checkpoint_pos = load_full_state ? -1 : candidate.checkpoints[best_checkpoint].pos_max;
 
     LOG_INFO("disk KV cache hit", {
@@ -1579,9 +1909,34 @@ bool server_disk_kv_cache::save_prompt(server_prompt prompt, bool wait_for_queue
             pending.checkpoints.push_back(std::move(checkpoint));
         }
     }
+
+    // A prompt loaded from a disk checkpoint may only have the one state that
+    // was needed for the current request in RAM. Inherit every already
+    // persisted checkpoint that is wholly inside this prompt's LCP as a
+    // manifest reference. This copies no state bytes and lets every Agent
+    // keep an independent, restart-safe manifest for the shared prefix.
+    const entry * inherited_source = nullptr;
+    size_t inherited_lcp = 0;
+    for (const auto & candidate : entries_) {
+        const size_t lcp = common_prefix_tokens(candidate.tokens, pending.value.tokens);
+        if (lcp > inherited_lcp ||
+            (lcp == inherited_lcp && inherited_source != nullptr &&
+                candidate.checkpoints.size() > inherited_source->checkpoints.size())) {
+            inherited_lcp = lcp;
+            inherited_source = &candidate;
+        }
+    }
+    if (inherited_source != nullptr && inherited_lcp > 0) {
+        for (const auto & checkpoint : inherited_source->checkpoints) {
+            if (checkpoint.n_tokens > 0 && checkpoint.n_tokens <= (int64_t) inherited_lcp &&
+                !checkpoint.blob_id.empty()) {
+                pending.inherited_checkpoints.push_back(checkpoint);
+            }
+        }
+    }
     const size_t token_count = pending.value.tokens.size();
     const size_t state_size = pending.state.size();
-    const size_t checkpoint_count = pending.checkpoints.size();
+    const size_t checkpoint_count = pending.checkpoints.size() + pending.inherited_checkpoints.size();
 
     size_t queue_depth = 0;
     {
@@ -1639,6 +1994,18 @@ void server_disk_kv_cache::writer_loop() {
             pending_saves_.pop_front();
             active_save active;
             active.tokens = pending.value.tokens.clone();
+            active.blob_ids.reserve(pending.checkpoints.size() + pending.inherited_checkpoints.size());
+            for (const auto & checkpoint : pending.inherited_checkpoints) {
+                if (!checkpoint.blob_id.empty()) {
+                    active.blob_ids.push_back(checkpoint.blob_id);
+                }
+            }
+            for (const auto & checkpoint : pending.checkpoints) {
+                if (checkpoint.n_tokens > 0 && !checkpoint.data.empty()) {
+                    active.blob_ids.push_back(checkpoint_blob_id(
+                        checkpoint.pos_min, checkpoint.pos_max, checkpoint.n_tokens, checkpoint.data));
+                }
+            }
             active_saves_.push_back(std::move(active));
             io_cv_.notify_all();
         }
@@ -1665,6 +2032,7 @@ void server_disk_kv_cache::write_pending_save(pending_save pending) {
     const auto state_tmp = namespace_path_ / (stem + ".state.tmp");
     const auto meta_tmp = namespace_path_ / (stem + ".meta.tmp");
     const auto checkpoint_tmp = namespace_path_ / (stem + ".ckpt.tmp");
+    const bool has_checkpoints = !pending.checkpoints.empty() || !pending.inherited_checkpoints.empty();
 
     const int64_t t_start = ggml_time_us();
     std::error_code ec;
@@ -1696,8 +2064,8 @@ void server_disk_kv_cache::write_pending_save(pending_save pending) {
         return;
     }
 
-    if (!pending.checkpoints.empty() &&
-        !write_checkpoint_file(checkpoint_tmp, pending.value, pending.checkpoints)) {
+    if (has_checkpoints &&
+        !write_checkpoint_file(checkpoint_tmp, pending.value, pending.checkpoints, pending.inherited_checkpoints)) {
         std::filesystem::remove(state_tmp, ec);
         std::filesystem::remove(meta_tmp, ec);
         std::filesystem::remove(checkpoint_tmp, ec);
@@ -1718,7 +2086,7 @@ void server_disk_kv_cache::write_pending_save(pending_save pending) {
 
     std::filesystem::remove(checkpoint_path, ec);
     ec.clear();
-    if (!pending.checkpoints.empty()) {
+    if (has_checkpoints) {
         std::filesystem::rename(checkpoint_tmp, checkpoint_path, ec);
         if (ec) {
             std::filesystem::remove(state_path, ec);
@@ -1749,15 +2117,13 @@ void server_disk_kv_cache::write_pending_save(pending_save pending) {
         return;
     }
     uintmax_t checkpoint_size = 0;
-    if (!pending.checkpoints.empty()) {
+    if (has_checkpoints) {
         checkpoint_size = std::filesystem::file_size(checkpoint_path, ec);
         if (ec) {
             return;
         }
     }
     pending.value.size_bytes = (uint64_t) state_size + (uint64_t) meta_size + (uint64_t) checkpoint_size;
-
-    enforce_root_quota_locked();
 
     const size_t token_count = pending.value.tokens.size();
     const size_t checkpoint_count = pending.value.checkpoints.size();
