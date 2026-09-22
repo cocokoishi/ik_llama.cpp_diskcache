@@ -59,6 +59,33 @@ static void disk_kv_cache_append_file_identity(std::ostringstream & out, const s
     }
 }
 
+static std::string disk_kv_cache_token_piece(const llama_context * ctx, llama_token token) {
+    if (ctx == nullptr || token < 0) {
+        return {};
+    }
+    return common_token_to_piece(ctx, token, true);
+}
+
+static std::string disk_kv_cache_token_window(
+        const llama_context * ctx,
+        const server_tokens & tokens,
+        size_t center) {
+    if (tokens.empty()) {
+        return {};
+    }
+
+    const size_t begin = center > 2 ? center - 2 : 0;
+    const size_t end = std::min(tokens.size(), center + 3);
+    std::ostringstream out;
+    for (size_t i = begin; i < end; ++i) {
+        if (i != begin) {
+            out << " | ";
+        }
+        out << i << ":" << tokens[i] << ":'" << disk_kv_cache_token_piece(ctx, tokens[i]) << "'";
+    }
+    return out.str();
+}
+
 static std::string disk_kv_cache_fingerprint(const gpt_params & params, llama_context * ctx) {
     std::ostringstream out;
     out << "ik-llama-disk-kv-v3|token-size=" << sizeof(llama_token)
@@ -1680,10 +1707,15 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
     }
 
     const size_t current_lcp = slot.cache_tokens.empty() ? 0 : common_prefix_tokens(slot.cache_tokens, requested);
+    const bool full_state_truncation_safe =
+        !llama_model_has_recurrent(llama_get_model(ctx_)) &&
+        !llama_kv_cache_is_compacted(ctx_) &&
+        slot.ga_n == 1;
     size_t best = std::numeric_limits<size_t>::max();
     size_t best_lcp = current_lcp;
     size_t best_restore_tokens = current_lcp;
     size_t best_checkpoint = std::numeric_limits<size_t>::max();
+    bool best_full_truncate = false;
 
     for (size_t i = 0; i < entries_.size(); ++i) {
         const entry & candidate = entries_[i];
@@ -1698,16 +1730,18 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
             continue;
         }
 
-        // A complete state is the fastest path, but it is only safe when the
-        // complete saved token sequence is a prefix of the new request.  When
-        // the request diverges after a long common prefix, use the newest
-        // persisted partial checkpoint that is still inside that prefix.  The
-        // partial state contains both generic KV rows and the model's
-        // recurrent/SSM state through llama_state_seq_*_data(PARTIAL_ONLY).
+        // A complete state is the fastest path.  For ordinary Transformer
+        // models, sequence state is fully rewindable by deleting the suffix
+        // after the LCP.  Hybrid/recurrent models are different: sequence
+        // removal cannot rewind their private SSM/conv state, so they must use
+        // the newest persisted partial checkpoint that is still inside the
+        // common prefix.  PARTIAL_ONLY carries that recurrent state.
         size_t restore_tokens = 0;
         size_t checkpoint = std::numeric_limits<size_t>::max();
-        if (lcp == candidate.tokens.size() && candidate.tokens.size() < requested.size()) {
-            restore_tokens = candidate.tokens.size();
+        bool full_truncate = false;
+        if (full_state_truncation_safe) {
+            restore_tokens = lcp;
+            full_truncate = lcp != candidate.tokens.size();
         } else {
             for (size_t j = 0; j < candidate.checkpoints.size(); ++j) {
                 const auto & cur = candidate.checkpoints[j];
@@ -1736,19 +1770,36 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
             {"lcp", lcp},
             {"restore_tokens", restore_tokens},
             {"checkpoints", candidate.checkpoints.size()},
-            {"restore_mode", checkpoint == std::numeric_limits<size_t>::max() ? "full" : "checkpoint"},
+            {"restore_mode", checkpoint == std::numeric_limits<size_t>::max()
+                ? (full_truncate ? "full-truncate" : "full")
+                : "checkpoint"},
         });
 
-        if (lcp > best_lcp ||
-            (lcp == best_lcp && (best == std::numeric_limits<size_t>::max() || restore_tokens > best_restore_tokens))) {
+        // Rank by the state that can actually be reused.  A large textual LCP
+        // with only a shallow safe checkpoint is less useful than a slightly
+        // shorter LCP backed by a deeper restorable state.
+        if (best == std::numeric_limits<size_t>::max() ||
+            restore_tokens > best_restore_tokens ||
+            (restore_tokens == best_restore_tokens &&
+                (lcp > best_lcp ||
+                    (lcp == best_lcp && checkpoint == std::numeric_limits<size_t>::max() &&
+                        best_checkpoint != std::numeric_limits<size_t>::max())))) {
             best = i;
             best_lcp = lcp;
             best_restore_tokens = restore_tokens;
             best_checkpoint = checkpoint;
+            best_full_truncate = full_truncate;
         }
     }
 
     if (best == std::numeric_limits<size_t>::max()) {
+        LOG_INFO("disk KV cache miss", {
+            {"requested_tokens", requested.size()},
+            {"current_lcp", current_lcp},
+            {"restore_mode", "none"},
+            {"restorable_tokens", 0},
+            {"new_tokens_to_prefill", requested.size()},
+        });
         return false;
     }
 
@@ -1756,8 +1807,27 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
     const int64_t t_start = ggml_time_us();
     const bool load_full_state = best_checkpoint == std::numeric_limits<size_t>::max();
     const size_t restore_tokens = load_full_state
-        ? candidate.tokens.size()
+        ? (best_full_truncate ? best_lcp : candidate.tokens.size())
         : (size_t) candidate.checkpoints[best_checkpoint].n_tokens;
+
+    const size_t mismatch = best_lcp < std::min(candidate.tokens.size(), requested.size())
+        ? best_lcp
+        : std::numeric_limits<size_t>::max();
+    LOG_INFO("disk KV cache candidate selected", {
+        {"candidate_tokens", candidate.tokens.size()},
+        {"requested_tokens", requested.size()},
+        {"lcp_tokens", best_lcp},
+        {"first_mismatch_token", mismatch == std::numeric_limits<size_t>::max() ? -1 : (int64_t) mismatch},
+        {"candidate_token", mismatch == std::numeric_limits<size_t>::max() ? -1 : (int64_t) candidate.tokens[mismatch]},
+        {"request_token", mismatch == std::numeric_limits<size_t>::max() ? -1 : (int64_t) requested[mismatch]},
+        {"candidate_piece_window", mismatch == std::numeric_limits<size_t>::max() ? std::string() : disk_kv_cache_token_window(ctx_, candidate.tokens, mismatch)},
+        {"request_piece_window", mismatch == std::numeric_limits<size_t>::max() ? std::string() : disk_kv_cache_token_window(ctx_, requested, mismatch)},
+        {"restorable_tokens", restore_tokens},
+        {"new_tokens_to_prefill", requested.size() > restore_tokens ? requested.size() - restore_tokens : 0},
+        {"restore_mode", load_full_state ? (best_full_truncate ? "full-truncate" : "full") : "checkpoint"},
+        {"checkpoint_tokens", load_full_state ? 0 : restore_tokens},
+    });
+
     server_prompt_checkpoint restored_checkpoint{};
     bool have_restored_checkpoint = false;
     {
@@ -1801,6 +1871,9 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
                 ctx_, state.data(), state.size(), slot.id,
                 load_full_state ? 0 : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             valid = nset == state.size();
+            if (valid && load_full_state && best_full_truncate) {
+                valid = llama_kv_cache_seq_rm(ctx_, slot.id, (llama_pos) restore_tokens, -1);
+            }
         }
 
         if (valid && !load_full_state) {
@@ -1808,6 +1881,15 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
             const llama_pos restored_pos = llama_kv_cache_seq_pos_max(ctx_, slot.id);
             if (restored_pos != checkpoint.pos_max) {
                 LLAMA_LOG_WARN("disk KV cache checkpoint position mismatch; falling back to prompt evaluation\n");
+                valid = false;
+            }
+        }
+
+        if (valid && load_full_state) {
+            const llama_pos restored_pos = llama_kv_cache_seq_pos_max(ctx_, slot.id);
+            const llama_pos expected_pos = restore_tokens > 0 ? (llama_pos) restore_tokens - 1 : -1;
+            if (restored_pos != expected_pos) {
+                LLAMA_LOG_WARN("disk KV cache full-state position mismatch; falling back to prompt evaluation\n");
                 valid = false;
             }
         }
@@ -1877,7 +1959,7 @@ bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & r
         {"matched_tokens", best_lcp},
         {"entry_tokens", candidate.tokens.size()},
         {"restored_tokens", restore_tokens},
-        {"restore_mode", load_full_state ? "full" : "checkpoint"},
+        {"restore_mode", load_full_state ? (best_full_truncate ? "full-truncate" : "full") : "checkpoint"},
         {"load_ms", (ggml_time_us() - t_start) / 1000.0},
     });
     return true;
