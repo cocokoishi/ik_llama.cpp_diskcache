@@ -238,10 +238,20 @@ public:
 
 private:
     struct entry {
+        struct checkpoint_index {
+            llama_pos pos_min = 0;
+            llama_pos pos_max = 0;
+            int64_t n_tokens = 0;
+            uint64_t data_offset = 0;
+            uint64_t data_size = 0;
+        };
+
         std::string stem;
         std::filesystem::path state_path;
         std::filesystem::path meta_path;
+        std::filesystem::path checkpoint_path;
         server_tokens tokens;
+        std::vector<checkpoint_index> checkpoints;
         int32_t n_kept_prompt = 0;
         int32_t n_discarded_prompt = 0;
         uint64_t size_bytes = 0;
@@ -251,10 +261,13 @@ private:
     struct pending_save {
         entry value;
         std::vector<uint8_t> state;
+        std::vector<server_prompt_checkpoint> checkpoints;
     };
 
     static constexpr uint32_t META_MAGIC = 0x3143564b; // "KVC1"
     static constexpr uint32_t META_VERSION = 3;
+    static constexpr uint32_t CHECKPOINT_MAGIC = 0x31545043; // "CPT1"
+    static constexpr uint32_t CHECKPOINT_VERSION = 1;
 
     llama_context * ctx_ = nullptr;
     std::filesystem::path root_path_;
@@ -281,7 +294,12 @@ private:
     std::string stem_for_tokens(const server_tokens & tokens) const;
     void scan();
     bool read_metadata(const std::filesystem::path & path, entry & result) const;
+    bool read_checkpoint_index(const std::filesystem::path & path, entry & result) const;
     bool write_metadata(const std::filesystem::path & path, const entry & value) const;
+    bool write_checkpoint_file(
+        const std::filesystem::path & path,
+        entry & value,
+        const std::vector<server_prompt_checkpoint> & checkpoints) const;
     bool remove_entry_files(const entry & value);
     void evict_if_needed(const std::string & keep_stem = "");
     bool enforce_root_quota_locked();
