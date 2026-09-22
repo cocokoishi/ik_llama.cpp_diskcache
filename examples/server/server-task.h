@@ -5,6 +5,8 @@
 #include <string>
 #include <unordered_set>
 #include <list>
+#include <functional>
+#include <utility>
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
@@ -441,6 +443,7 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
     llama_context* ctx;
+    std::function<void(server_prompt &&)> on_evict;
     size_t size() const;
 
     size_t n_tokens() const;
@@ -448,6 +451,10 @@ struct server_prompt_cache {
     server_prompt* alloc(const server_prompt& prompt, size_t state_size);
 
     bool load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot, float min_reusable_fraction);
+
+    void set_evict_callback(std::function<void(server_prompt &&)> callback) {
+        on_evict = std::move(callback);
+    }
 
     void update();
 };

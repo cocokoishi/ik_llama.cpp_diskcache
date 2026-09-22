@@ -17,6 +17,7 @@
 #include "chat.h"
 #include "json-schema-to-grammar.h"
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -28,6 +29,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -1107,6 +1109,42 @@ static common_speculative_stage_params common_speculative_stage_from_arg(const s
 
     return stage;
 }
+}
+
+static uint64_t parse_disk_kv_cache_size(const std::string & text) {
+    std::string value = text;
+    for (char & c : value) {
+        c = (char) std::tolower((unsigned char) c);
+    }
+
+    size_t pos = 0;
+    const double number = std::stod(value, &pos);
+    if (!std::isfinite(number) || number <= 0.0) {
+        throw std::invalid_argument("disk KV cache size must be a positive number");
+    }
+
+    const std::string suffix = value.substr(pos);
+    uint64_t multiplier = 1;
+    if (suffix == "b" || suffix.empty()) {
+        multiplier = 1;
+    } else if (suffix == "k" || suffix == "kb" || suffix == "ki" || suffix == "kib") {
+        multiplier = 1024ull;
+    } else if (suffix == "m" || suffix == "mb" || suffix == "mi" || suffix == "mib") {
+        multiplier = 1024ull * 1024ull;
+    } else if (suffix == "g" || suffix == "gb" || suffix == "gi" || suffix == "gib") {
+        multiplier = 1024ull * 1024ull * 1024ull;
+    } else if (suffix == "t" || suffix == "tb" || suffix == "ti" || suffix == "tib") {
+        multiplier = 1024ull * 1024ull * 1024ull * 1024ull;
+    } else {
+        throw std::invalid_argument("invalid disk KV cache size suffix: " + suffix);
+    }
+
+    const long double bytes = (long double) number * (long double) multiplier;
+    if (bytes > (long double) std::numeric_limits<uint64_t>::max()) {
+        throw std::invalid_argument("disk KV cache size is too large");
+    }
+
+    return (uint64_t) bytes;
 }
 
 #define CHECK_ARG if (++i >= argc) { invalid_param = true; return true; }
@@ -2661,6 +2699,18 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--disk-kvcache") {
+        CHECK_ARG
+        params.disk_kv_cache_path = argv[i];
+
+        // The size is optional so `--disk-kvcache PATH` uses the 10 GiB
+        // default.  A following option still belongs to the normal parser.
+        if (i + 1 < argc && argv[i + 1][0] != '-') {
+            ++i;
+            params.disk_kv_cache_size = parse_disk_kv_cache_size(argv[i]);
+        }
+        return true;
+    }
     if (arg == "--reasoning-tokens") {
         CHECK_ARG
         params.think_tokens = thinking_tokens_from_string(std::string(argv[i]));
@@ -3071,6 +3121,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-cram, --cache-ram N",          "set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)",params.cache_ram_mib });
     options.push_back({ "*",           "-crs,  --cache-ram-similarity N",           "minimum fraction of a cached entry that must match the new prompt for that entry to be reusable (default: %.2f).",params.cache_ram_similarity });
     options.push_back({ "*",           "-cram-n-min N, --cache-ram-n-min N",           "minimum number of the cached tokens that triggers prompt cache (default: %d).", params.cache_ram_n_min });
+    options.push_back({ "server",      "       --disk-kvcache PATH [SIZE]", "persistent on-disk KV/prefix cache (default SIZE: 10 GiB; disabled unless PATH is set)" });
     options.push_back({ "*",           "-n,    --predict N",            "number of tokens to predict (default: %d, -1 = infinity, -2 = until context filled)", params.n_predict });
     options.push_back({ "*",           "-b,    --batch-size N",         "logical maximum batch size (default: %d)", params.n_batch });
     options.push_back({ "*",           "-ub,   --ubatch-size N",        "physical maximum batch size (default: %d)", params.n_ubatch });

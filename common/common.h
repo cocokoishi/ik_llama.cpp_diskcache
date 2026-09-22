@@ -550,6 +550,11 @@ struct gpt_params {
     std::string sql_save_file;
     std::string sqlite_zstd_ext_file;
 
+    // Persistent server-side KV/prefix cache.  The cache is opt-in: an empty
+    // path leaves the existing in-memory prompt cache behavior unchanged.
+    std::string disk_kv_cache_path;
+    uint64_t    disk_kv_cache_size = 10ull * 1024ull * 1024ull * 1024ull;
+
     float slot_prompt_similarity = 0.1f;
 
     bool do_checkpoint = false;               // do checkpoint for recurrent models only

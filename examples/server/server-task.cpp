@@ -1140,9 +1140,10 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
         prompt = std::move(*it_best);
 
         states.erase(it_best);
+        return true;
     }
 
-    return true;
+    return false;
 }
 
 server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t state_size) {
@@ -1210,6 +1211,9 @@ void server_prompt_cache::update() {
 
             LLAMA_LOG_INFO(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            if (on_evict) {
+                on_evict(std::move(states.front()));
+            }
             states.pop_front();
         }
     }

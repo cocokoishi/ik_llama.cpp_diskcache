@@ -14,9 +14,16 @@
 #include "mtmd-helper.h"
 
 #include <fstream>
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
 #include <iostream>
+#include <limits>
 #include <regex>
 #include <exception>
+#include <set>
+#include <system_error>
 
 // DFlash/DSpark (draft model family) and MTP stages work with multimodal
 static bool server_speculative_multimodal_supported(const common_params_speculative & params) {
@@ -31,6 +38,65 @@ static bool server_speculative_multimodal_supported(const common_params_speculat
         }
     }
     return true;
+}
+
+static void disk_kv_cache_append_file_identity(std::ostringstream & out, const std::string & path) {
+    out << path;
+    if (path.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path file_path(path);
+    if (std::filesystem::is_regular_file(file_path, ec)) {
+        const uintmax_t size = std::filesystem::file_size(file_path, ec);
+        out << "|size=" << size;
+        ec.clear();
+        const auto mtime = std::filesystem::last_write_time(file_path, ec);
+        if (!ec) {
+            out << "|mtime=" << mtime.time_since_epoch().count();
+        }
+    }
+}
+
+static std::string disk_kv_cache_fingerprint(const gpt_params & params, llama_context * ctx) {
+    std::ostringstream out;
+    out << "ik-llama-disk-kv-v3|token-size=" << sizeof(llama_token)
+        << "|ctx=" << llama_n_ctx(ctx)
+        << "|parallel=" << params.n_parallel
+        << "|cache-k=" << params.cache_type_k
+        << "|cache-v=" << params.cache_type_v
+        << "|mla=" << params.mla_attn
+        << "|k-hadamard=" << params.k_cache_hadamard
+        << "|v-hadamard=" << params.v_cache_hadamard
+        << "|no-kv-offload=" << params.no_kv_offload
+        << "|model=";
+    disk_kv_cache_append_file_identity(out, params.model);
+    out << "|mmproj=";
+    disk_kv_cache_append_file_identity(out, params.mmproj.path);
+    return out.str();
+}
+
+static bool disk_kv_cache_read_last_used(const std::filesystem::path & path, uint64_t & last_used) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint64_t n_tokens = 0;
+    int32_t n_kept_prompt = 0;
+    int32_t n_discarded_prompt = 0;
+
+    file.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char *>(&version), sizeof(version));
+    file.read(reinterpret_cast<char *>(&n_tokens), sizeof(n_tokens));
+    file.read(reinterpret_cast<char *>(&n_kept_prompt), sizeof(n_kept_prompt));
+    file.read(reinterpret_cast<char *>(&n_discarded_prompt), sizeof(n_discarded_prompt));
+    file.read(reinterpret_cast<char *>(&last_used), sizeof(last_used));
+    constexpr uint32_t meta_magic = 0x3143564b; // "KVC1"
+    return file.gcount() == (std::streamsize) sizeof(last_used) && magic == meta_magic && n_tokens != 0;
 }
 
 static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min, llama_pos pos_max) {
@@ -185,6 +251,17 @@ static common_speculative_stage_params server_parse_speculative_stage_json(const
 }
 
 server_context::~server_context() {
+    // The disk cache is a second-level cache. Flush the RAM cache only during
+    // orderly shutdown so a later process can warm from it; normal requests
+    // never persist hot entries just because they were used.
+    if (disk_kv_cache && disk_kv_cache->enabled() && prompt_cache) {
+        while (!prompt_cache->states.empty()) {
+            server_prompt prompt = std::move(prompt_cache->states.back());
+            prompt_cache->states.pop_back();
+            disk_kv_cache->save_prompt(std::move(prompt), true);
+        }
+    }
+
     // Speculative state may reference the live target context during teardown.
     for (server_slot& slot : slots) {
         if (slot.ctx_sampling != nullptr) {
@@ -426,6 +503,24 @@ void server_context::init() {
         }
     }
 
+    if (!params_base.disk_kv_cache_path.empty()) {
+        if (!llama_model_supports_partial_kv_reuse(model)) {
+            LLAMA_LOG_WARN("disk KV cache is disabled because this model does not support reusable sequence state\n");
+        } else {
+            disk_kv_cache = std::make_unique<server_disk_kv_cache>(
+                ctx,
+                params_base.disk_kv_cache_path,
+                params_base.disk_kv_cache_size,
+                disk_kv_cache_fingerprint(params_base, ctx));
+        }
+    }
+
+    if (prompt_cache && disk_kv_cache && disk_kv_cache->enabled()) {
+        prompt_cache->set_evict_callback([this](server_prompt && prompt) {
+            disk_kv_cache->save_prompt(std::move(prompt));
+        });
+    }
+
     // populate chat template params
     {
         common_chat_templates_ptr chat_templates;
@@ -485,11 +580,12 @@ void server_slot::prompt_save(server_prompt_cache& prompt_cache) const {
     llama_state_seq_get_data(ctx, cur->data.data(), cur_size, id, 0);
 }
 
-void server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, float min_reusable_fraction) {
-    bool res = prompt_cache.load(server_cached_prompt, tokens, ctx, id, min_reusable_fraction);
+bool server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, float min_reusable_fraction) {
+    const bool res = prompt_cache.load(server_cached_prompt, tokens, ctx, id, min_reusable_fraction);
     if (!res) {
         LLAMA_LOG_INFO("failed to load prompt from cache\n");
     }
+    return res;
 }
 
 void server_slot::reset() {
@@ -649,6 +745,704 @@ void server_slot::release() {
     }
     spec_target_only = false;
     llama_decode_reset();
+}
+
+
+uint64_t server_disk_kv_cache::now_ticks() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+bool server_disk_kv_cache::has_media_tokens(const server_tokens & tokens) {
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] == LLAMA_TOKEN_NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t server_disk_kv_cache::common_prefix_tokens(const server_tokens & a, const server_tokens & b) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    for (; i < n && a[i] == b[i]; ++i) {
+    }
+    return i;
+}
+
+server_disk_kv_cache::server_disk_kv_cache(
+        llama_context * ctx,
+        const std::string & path,
+        uint64_t max_bytes,
+        const std::string & fingerprint)
+    : ctx_(ctx), fingerprint_(fingerprint), max_bytes_(max_bytes) {
+    if (ctx_ == nullptr || path.empty() || max_bytes_ == 0) {
+        return;
+    }
+
+    std::error_code ec;
+    root_path_ = std::filesystem::absolute(std::filesystem::path(path), ec);
+    if (ec) {
+        root_path_ = std::filesystem::path(path);
+        ec.clear();
+    }
+
+    const std::string namespace_hash = fnv_hash(
+        reinterpret_cast<const uint8_t *>(fingerprint_.data()), fingerprint_.size());
+    namespace_path_ = root_path_ / ("v2-" + namespace_hash);
+
+    std::filesystem::create_directories(namespace_path_, ec);
+    if (ec || !std::filesystem::is_directory(namespace_path_, ec)) {
+        LOG_WARNING("disk KV cache disabled: unable to create cache directory", {
+            {"path", namespace_path_.string()},
+            {"error", ec ? ec.message() : "not a directory"},
+        });
+        return;
+    }
+
+    enabled_ = true;
+    {
+        std::lock_guard<std::mutex> fs_lock(fs_mutex_);
+        enforce_root_quota_locked();
+    }
+    scan();
+    evict_if_needed();
+    io_thread_ = std::thread(&server_disk_kv_cache::writer_loop, this);
+
+    LOG_INFO("disk KV cache enabled", {
+        {"path", namespace_path_.string()},
+        {"limit_bytes", max_bytes_},
+        {"used_bytes", used_bytes_},
+        {"entries", entries_.size()},
+    });
+}
+
+server_disk_kv_cache::~server_disk_kv_cache() {
+    {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        io_stop_ = true;
+    }
+    io_cv_.notify_one();
+    if (io_thread_.joinable()) {
+        io_thread_.join();
+    }
+
+    // The writer has finished all queued snapshots.  Fold successful writes
+    // into the in-memory index once more so quota enforcement also applies
+    // during orderly shutdown.
+    drain_completed_saves();
+    evict_if_needed();
+}
+
+std::string server_disk_kv_cache::stem_for_tokens(const server_tokens & tokens) const {
+    std::vector<uint8_t> key(sizeof(uint64_t) + tokens.size() * sizeof(llama_token));
+    const uint64_t n_tokens = tokens.size();
+    std::memcpy(key.data(), &n_tokens, sizeof(n_tokens));
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        std::memcpy(key.data() + sizeof(n_tokens) + i * sizeof(llama_token), &tokens[i], sizeof(llama_token));
+    }
+    return "prefix-" + fnv_hash(key.data(), key.size());
+}
+
+bool server_disk_kv_cache::read_metadata(const std::filesystem::path & path, entry & result) const {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint64_t n_tokens = 0;
+    uint64_t last_used = 0;
+    int32_t n_kept_prompt = 0;
+    int32_t n_discarded_prompt = 0;
+
+    file.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char *>(&version), sizeof(version));
+    file.read(reinterpret_cast<char *>(&n_tokens), sizeof(n_tokens));
+    file.read(reinterpret_cast<char *>(&n_kept_prompt), sizeof(n_kept_prompt));
+    file.read(reinterpret_cast<char *>(&n_discarded_prompt), sizeof(n_discarded_prompt));
+    file.read(reinterpret_cast<char *>(&last_used), sizeof(last_used));
+
+    if (!file || magic != META_MAGIC || version != META_VERSION || n_tokens == 0 ||
+        n_tokens > (uint64_t) llama_n_ctx(ctx_)) {
+        return false;
+    }
+
+    std::vector<llama_token> tokens((size_t) n_tokens);
+    file.read(reinterpret_cast<char *>(tokens.data()), tokens.size() * sizeof(llama_token));
+    if (!file) {
+        return false;
+    }
+
+    result.stem = path.stem().string();
+    result.meta_path = path;
+    result.state_path = path;
+    result.state_path.replace_extension(".state");
+    result.tokens = server_tokens(tokens, false);
+    result.n_kept_prompt = n_kept_prompt;
+    result.n_discarded_prompt = n_discarded_prompt;
+    result.last_used = last_used != 0 ? last_used : now_ticks();
+    return true;
+}
+
+bool server_disk_kv_cache::write_metadata(const std::filesystem::path & path, const entry & value) const {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        return false;
+    }
+
+    const uint32_t magic = META_MAGIC;
+    const uint32_t version = META_VERSION;
+    const uint64_t n_tokens = value.tokens.size();
+
+    file.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+    file.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    file.write(reinterpret_cast<const char *>(&n_tokens), sizeof(n_tokens));
+    file.write(reinterpret_cast<const char *>(&value.n_kept_prompt), sizeof(value.n_kept_prompt));
+    file.write(reinterpret_cast<const char *>(&value.n_discarded_prompt), sizeof(value.n_discarded_prompt));
+    file.write(reinterpret_cast<const char *>(&value.last_used), sizeof(value.last_used));
+
+    for (size_t i = 0; i < value.tokens.size(); ++i) {
+        const llama_token token = value.tokens[i];
+        file.write(reinterpret_cast<const char *>(&token), sizeof(token));
+    }
+    file.flush();
+    return file.good();
+}
+
+void server_disk_kv_cache::scan() {
+    entries_.clear();
+    used_bytes_ = 0;
+
+    std::error_code ec;
+    for (const auto & item : std::filesystem::directory_iterator(namespace_path_, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!item.is_regular_file(ec) || item.path().extension() != ".meta") {
+            continue;
+        }
+
+        entry value;
+        if (!read_metadata(item.path(), value) || !std::filesystem::is_regular_file(value.state_path, ec)) {
+            continue;
+        }
+
+        const uintmax_t state_size = std::filesystem::file_size(value.state_path, ec);
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        const uintmax_t meta_size = std::filesystem::file_size(value.meta_path, ec);
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+
+        value.size_bytes = (uint64_t) state_size + (uint64_t) meta_size;
+        entries_.push_back(std::move(value));
+        used_bytes_ += entries_.back().size_bytes;
+    }
+}
+
+bool server_disk_kv_cache::remove_entry_files(const entry & value) {
+    const auto remove_one = [](const std::filesystem::path & path) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        if (ec) {
+            return false;
+        }
+        ec.clear();
+        return !std::filesystem::exists(path, ec) && !ec;
+    };
+    const bool state_removed = remove_one(value.state_path);
+    const bool meta_removed = remove_one(value.meta_path);
+    return state_removed && meta_removed;
+}
+
+void server_disk_kv_cache::evict_if_needed(const std::string & keep_stem) {
+    while (used_bytes_ > max_bytes_ && !entries_.empty()) {
+        size_t victim = std::numeric_limits<size_t>::max();
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (!keep_stem.empty() && entries_[i].stem == keep_stem) {
+                continue;
+            }
+            if (victim == std::numeric_limits<size_t>::max() || entries_[i].last_used < entries_[victim].last_used) {
+                victim = i;
+            }
+        }
+        if (victim == std::numeric_limits<size_t>::max()) {
+            // A single entry can be larger than the configured quota.  It is
+            // better to remove it than silently exceed the user's limit.
+            victim = 0;
+        }
+
+        const std::string victim_stem = entries_[victim].stem;
+        const uint64_t victim_size = entries_[victim].size_bytes;
+        if (!remove_entry_files(entries_[victim])) {
+            LLAMA_LOG_WARN("disk KV cache eviction failed; leaving entry on disk\n");
+            entries_.erase(entries_.begin() + victim);
+            continue;
+        }
+        used_bytes_ = used_bytes_ >= victim_size ? used_bytes_ - victim_size : 0;
+        entries_.erase(entries_.begin() + victim);
+
+        LOG_INFO("disk KV cache eviction", {
+            {"entry", victim_stem},
+            {"used_bytes", used_bytes_},
+            {"limit_bytes", max_bytes_},
+        });
+    }
+}
+
+bool server_disk_kv_cache::enforce_root_quota_locked() {
+    struct root_entry {
+        std::vector<std::filesystem::path> files;
+        uint64_t size_bytes = 0;
+        uint64_t last_used = 0;
+    };
+
+    // Count complete entries as pairs, but also count stale .tmp files and
+    // orphaned .meta/.state files. They are not loadable, yet they still
+    // consume the user's disk quota.
+    std::vector<std::filesystem::path> files;
+    std::error_code ec;
+    for (std::filesystem::recursive_directory_iterator it(root_path_, ec), end; it != end && !ec; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) {
+            ec.clear();
+            continue;
+        }
+        const auto namespace_name = it->path().parent_path().filename().string();
+        const auto extension = it->path().extension().string();
+        if (namespace_name.rfind("v", 0) == 0 &&
+            (extension == ".meta" || extension == ".state" || extension == ".tmp")) {
+            files.push_back(it->path());
+        }
+    }
+
+    const std::set<std::filesystem::path> file_set(files.begin(), files.end());
+    std::set<std::filesystem::path> accounted;
+    std::vector<root_entry> candidates;
+    uint64_t total_bytes = 0;
+    const auto file_time_ticks = [](const std::filesystem::path & path) {
+        std::error_code time_ec;
+        const auto file_time = std::filesystem::last_write_time(path, time_ec);
+        return time_ec ? uint64_t(0) : (uint64_t) file_time.time_since_epoch().count();
+    };
+    const auto add_candidate = [&](std::vector<std::filesystem::path> candidate_files, uint64_t last_used) {
+        uint64_t size_bytes = 0;
+        for (const auto & path : candidate_files) {
+            std::error_code size_ec;
+            const uintmax_t size = std::filesystem::file_size(path, size_ec);
+            if (size_ec) {
+                return;
+            }
+            size_bytes += (uint64_t) size;
+        }
+        for (const auto & path : candidate_files) {
+            accounted.insert(path);
+        }
+        candidates.push_back({std::move(candidate_files), size_bytes, last_used});
+        total_bytes += size_bytes;
+    };
+
+    for (const auto & meta_path : files) {
+        if (meta_path.extension() != ".meta" || accounted.count(meta_path) != 0) {
+            continue;
+        }
+
+        auto state_path = meta_path;
+        state_path.replace_extension(".state");
+        if (file_set.count(state_path) != 0 && accounted.count(state_path) == 0) {
+            uint64_t last_used = 0;
+            if (!disk_kv_cache_read_last_used(meta_path, last_used) || last_used == 0) {
+                last_used = file_time_ticks(meta_path);
+            }
+            add_candidate({meta_path, state_path}, last_used);
+        }
+        else {
+            add_candidate({meta_path}, file_time_ticks(meta_path));
+        }
+    }
+
+    for (const auto & path : files) {
+        if (accounted.count(path) == 0) {
+            add_candidate({path}, file_time_ticks(path));
+        }
+    }
+
+    if (total_bytes <= max_bytes_) {
+        return false;
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const root_entry & a, const root_entry & b) {
+        return a.last_used < b.last_used;
+    });
+
+    bool changed = false;
+    for (const auto & victim : candidates) {
+        if (total_bytes <= max_bytes_) {
+            break;
+        }
+
+        uint64_t removed_bytes = 0;
+        bool removal_failed = false;
+        for (const auto & path : victim.files) {
+            std::error_code size_ec;
+            const uintmax_t size = std::filesystem::file_size(path, size_ec);
+            std::error_code remove_ec;
+            std::filesystem::remove(path, remove_ec);
+            if (remove_ec || std::filesystem::exists(path, remove_ec)) {
+                removal_failed = true;
+                continue;
+            }
+            removed_bytes += size_ec ? 0 : (uint64_t) size;
+        }
+        total_bytes = total_bytes >= removed_bytes ? total_bytes - removed_bytes : 0;
+        changed = changed || removed_bytes != 0;
+
+        LOG_INFO("disk KV cache root eviction", {
+            {"entry", victim.files.front().stem().string()},
+            {"used_bytes", total_bytes},
+            {"limit_bytes", max_bytes_},
+        });
+        if (removal_failed) {
+            LLAMA_LOG_WARN("disk KV cache root eviction could not remove every stale file\n");
+        }
+    }
+    if (total_bytes > max_bytes_) {
+        LLAMA_LOG_WARN("disk KV cache remains over quota because some files could not be removed\n");
+    }
+    return changed;
+}
+
+void server_disk_kv_cache::prune_missing_entries() {
+    for (size_t i = 0; i < entries_.size();) {
+        std::error_code ec;
+        const bool state_exists = std::filesystem::is_regular_file(entries_[i].state_path, ec);
+        ec.clear();
+        const bool meta_exists = std::filesystem::is_regular_file(entries_[i].meta_path, ec);
+        if (state_exists && meta_exists) {
+            ++i;
+            continue;
+        }
+
+        used_bytes_ = used_bytes_ >= entries_[i].size_bytes
+            ? used_bytes_ - entries_[i].size_bytes
+            : 0;
+        entries_.erase(entries_.begin() + i);
+    }
+}
+
+void server_disk_kv_cache::drain_completed_saves() {
+    std::deque<entry> completed;
+    {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        completed.swap(completed_saves_);
+    }
+
+    for (auto & value : completed) {
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].stem == value.stem) {
+                used_bytes_ = used_bytes_ >= entries_[i].size_bytes
+                    ? used_bytes_ - entries_[i].size_bytes
+                    : 0;
+                entries_.erase(entries_.begin() + i);
+                break;
+            }
+        }
+        used_bytes_ += value.size_bytes;
+        entries_.push_back(std::move(value));
+    }
+
+    prune_missing_entries();
+    if (!completed.empty()) {
+        evict_if_needed();
+    }
+}
+
+bool server_disk_kv_cache::load_best(server_slot & slot, const server_tokens & requested, float min_reusable_fraction, bool has_mtmd) {
+    drain_completed_saves();
+
+    if (!enabled_ || requested.empty() || has_media_tokens(requested)) {
+        return false;
+    }
+
+    const size_t current_lcp = slot.cache_tokens.empty() ? 0 : common_prefix_tokens(slot.cache_tokens, requested);
+    size_t best = std::numeric_limits<size_t>::max();
+    size_t best_lcp = current_lcp;
+    size_t best_entry_size = 0;
+
+    for (size_t i = 0; i < entries_.size(); ++i) {
+        const entry & candidate = entries_[i];
+        if (has_media_tokens(candidate.tokens)) {
+            continue;
+        }
+
+        const size_t lcp = common_prefix_tokens(candidate.tokens, requested);
+        // A full sequence state cannot be safely rewound for hybrid/recurrent
+        // models.  Only load entries that are complete prefix units; prompt
+        // boundary and interval saves below create those units.
+        if (lcp != candidate.tokens.size()) {
+            continue;
+        }
+        // An exact-length KV snapshot does not contain the logits buffer. The
+        // server normally rewinds one token to produce those logits, which
+        // needs a partial checkpoint. Prefer the immediately preceding prompt
+        // boundary snapshot instead; it is safe to extend normally.
+        if (candidate.tokens.size() == requested.size()) {
+            continue;
+        }
+        const size_t fraction_tokens = (size_t) std::ceil(std::max(0.0f, min_reusable_fraction) * candidate.tokens.size());
+        const size_t required = std::min(candidate.tokens.size(), std::max<size_t>(1, std::min<size_t>(32, fraction_tokens)));
+        if (lcp < required) {
+            continue;
+        }
+
+        if (lcp > best_lcp || (lcp == best_lcp && (best == std::numeric_limits<size_t>::max() || candidate.tokens.size() < best_entry_size))) {
+            best = i;
+            best_lcp = lcp;
+            best_entry_size = candidate.tokens.size();
+        }
+    }
+
+    if (best == std::numeric_limits<size_t>::max()) {
+        return false;
+    }
+
+    entry & candidate = entries_[best];
+    const int64_t t_start = ggml_time_us();
+    {
+        std::lock_guard<std::mutex> fs_lock(fs_mutex_);
+        bool valid = false;
+        std::vector<uint8_t> state;
+        std::error_code ec;
+        const uintmax_t state_size = std::filesystem::file_size(candidate.state_path, ec);
+        if (!ec && state_size > 0 && state_size <= std::numeric_limits<size_t>::max()) {
+            state.resize((size_t) state_size);
+            std::ifstream file(candidate.state_path, std::ios::binary);
+            if (file) {
+                file.read(reinterpret_cast<char *>(state.data()), (std::streamsize) state.size());
+                valid = file.gcount() == (std::streamsize) state.size();
+            }
+        }
+
+        if (valid) {
+            const size_t nset = llama_state_seq_set_data(ctx_, state.data(), state.size(), slot.id, 0);
+            valid = nset == state.size();
+        }
+
+        if (!valid) {
+            LLAMA_LOG_WARN("disk KV cache entry failed validation; falling back to prompt evaluation\n");
+            llama_kv_cache_seq_rm(ctx_, slot.id, -1, -1);
+            slot.cache_tokens.clear();
+            slot.server_cached_prompt.checkpoints.clear();
+            slot.server_cached_prompt.data.clear();
+            return false;
+        }
+
+        candidate.last_used = now_ticks();
+        auto meta_tmp = candidate.meta_path;
+        meta_tmp += ".tmp";
+        if (write_metadata(meta_tmp, candidate)) {
+            std::filesystem::remove(candidate.meta_path, ec);
+            ec.clear();
+            std::filesystem::rename(meta_tmp, candidate.meta_path, ec);
+            if (ec) {
+                std::filesystem::remove(meta_tmp, ec);
+            }
+        } else {
+            std::filesystem::remove(meta_tmp, ec);
+        }
+        std::filesystem::last_write_time(candidate.state_path, std::filesystem::file_time_type::clock::now(), ec);
+    }
+
+    slot.cache_tokens = candidate.tokens.clone();
+    slot.cache_tokens.has_mtmd = has_mtmd;
+    slot.n_past = (int32_t) slot.cache_tokens.size();
+    slot.n_past_prompt = 0;
+    slot.n_kept_prompt = candidate.n_kept_prompt;
+    slot.n_discarded_prompt = candidate.n_discarded_prompt;
+    slot.server_cached_prompt.tokens = slot.cache_tokens.clone();
+    slot.server_cached_prompt.n_kept_prompt = candidate.n_kept_prompt;
+    slot.server_cached_prompt.n_discarded_prompt = candidate.n_discarded_prompt;
+    slot.server_cached_prompt.data.clear();
+    slot.server_cached_prompt.checkpoints.clear();
+
+    LOG_INFO("disk KV cache hit", {
+        {"id_slot", slot.id},
+        {"matched_tokens", best_lcp},
+        {"entry_tokens", candidate.tokens.size()},
+        {"load_ms", (ggml_time_us() - t_start) / 1000.0},
+    });
+    return true;
+}
+
+bool server_disk_kv_cache::save_prompt(server_prompt prompt, bool wait_for_queue) {
+    if (!enabled_ || prompt.tokens.empty() || has_media_tokens(prompt.tokens) || prompt.data.empty()) {
+        return false;
+    }
+
+    const std::string stem = stem_for_tokens(prompt.tokens);
+    entry value;
+    value.stem = stem;
+    value.state_path = namespace_path_ / (stem + ".state");
+    value.meta_path = namespace_path_ / (stem + ".meta");
+    value.tokens = prompt.tokens.clone();
+    value.n_kept_prompt = prompt.n_kept_prompt;
+    value.n_discarded_prompt = prompt.n_discarded_prompt;
+    value.last_used = now_ticks();
+
+    pending_save pending;
+    pending.value = std::move(value);
+    pending.state = std::move(prompt.data);
+    const size_t token_count = pending.value.tokens.size();
+    const size_t state_size = pending.state.size();
+
+    size_t queue_depth = 0;
+    {
+        std::unique_lock<std::mutex> lock(io_mutex_);
+        if (wait_for_queue) {
+            io_cv_.wait(lock, [this]() {
+                return io_stop_ || pending_saves_.size() < MAX_PENDING_SAVES;
+            });
+        }
+        if (pending_saves_.size() >= MAX_PENDING_SAVES) {
+            LLAMA_LOG_WARN("disk KV cache spill skipped because the writer queue is full\n");
+            return false;
+        }
+        bool replaced = false;
+        for (auto & queued : pending_saves_) {
+            if (queued.value.stem == pending.value.stem) {
+                queued = std::move(pending);
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            pending_saves_.push_back(std::move(pending));
+        }
+        queue_depth = pending_saves_.size();
+    }
+    io_cv_.notify_one();
+
+    LOG_INFO("disk KV cache snapshot queued", {
+        {"tokens", token_count},
+        {"bytes", state_size},
+        {"queue_depth", queue_depth},
+    });
+    return true;
+}
+
+void server_disk_kv_cache::writer_loop() {
+    while (true) {
+        pending_save pending;
+        {
+            std::unique_lock<std::mutex> lock(io_mutex_);
+            io_cv_.wait(lock, [this]() {
+                return io_stop_ || !pending_saves_.empty();
+            });
+
+            if (pending_saves_.empty()) {
+                if (io_stop_) {
+                    break;
+                }
+                continue;
+            }
+
+            pending = std::move(pending_saves_.front());
+            pending_saves_.pop_front();
+            io_cv_.notify_all();
+        }
+
+        write_pending_save(std::move(pending));
+    }
+}
+
+void server_disk_kv_cache::write_pending_save(pending_save pending) {
+    std::lock_guard<std::mutex> fs_lock(fs_mutex_);
+
+    const std::string stem = pending.value.stem;
+    const auto state_path = pending.value.state_path;
+    const auto meta_path = pending.value.meta_path;
+    const auto state_tmp = namespace_path_ / (stem + ".state.tmp");
+    const auto meta_tmp = namespace_path_ / (stem + ".meta.tmp");
+
+    const int64_t t_start = ggml_time_us();
+    std::error_code ec;
+    std::filesystem::remove(state_tmp, ec);
+    ec.clear();
+    std::filesystem::remove(meta_tmp, ec);
+
+    {
+        std::ofstream file(state_tmp, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            LLAMA_LOG_WARN("disk KV cache save failed while opening state file\n");
+            return;
+        }
+        file.write(reinterpret_cast<const char *>(pending.state.data()), (std::streamsize) pending.state.size());
+        file.flush();
+        if (!file.good()) {
+            std::filesystem::remove(state_tmp, ec);
+            LLAMA_LOG_WARN("disk KV cache save failed while writing state file\n");
+            return;
+        }
+    }
+
+    if (!write_metadata(meta_tmp, pending.value)) {
+        std::filesystem::remove(state_tmp, ec);
+        std::filesystem::remove(meta_tmp, ec);
+        LLAMA_LOG_WARN("disk KV cache save failed while writing metadata\n");
+        return;
+    }
+
+    std::filesystem::remove(state_path, ec);
+    ec.clear();
+    std::filesystem::rename(state_tmp, state_path, ec);
+    if (ec) {
+        std::filesystem::remove(state_tmp, ec);
+        std::filesystem::remove(meta_tmp, ec);
+        LLAMA_LOG_WARN("disk KV cache save failed while committing state file\n");
+        return;
+    }
+
+    std::filesystem::remove(meta_path, ec);
+    ec.clear();
+    std::filesystem::rename(meta_tmp, meta_path, ec);
+    if (ec) {
+        std::filesystem::remove(state_path, ec);
+        std::filesystem::remove(meta_tmp, ec);
+        LLAMA_LOG_WARN("disk KV cache save failed while committing metadata\n");
+        return;
+    }
+
+    const uintmax_t state_size = std::filesystem::file_size(state_path, ec);
+    if (ec) {
+        return;
+    }
+    const uintmax_t meta_size = std::filesystem::file_size(meta_path, ec);
+    if (ec) {
+        return;
+    }
+    pending.value.size_bytes = (uint64_t) state_size + (uint64_t) meta_size;
+
+    enforce_root_quota_locked();
+
+    const size_t token_count = pending.value.tokens.size();
+    size_t queue_depth = 0;
+    {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        completed_saves_.push_back(std::move(pending.value));
+        queue_depth = pending_saves_.size();
+    }
+
+    LOG_INFO("disk KV cache saved", {
+        {"tokens", token_count},
+        {"bytes", state_size},
+        {"save_ms", (ggml_time_us() - t_start) / 1000.0},
+        {"queue_depth", queue_depth},
+    });
 }
 
 
@@ -1071,21 +1865,36 @@ server_slot* server_context::get_available_slot(const server_task& task) {
             copy_data_to_cached_prompt(tokens, *ret);
 
             ret->prompt_save(*prompt_cache);
+            // Enforce the RAM limit immediately. Any entry removed here is
+            // handed to the disk second-level cache by the eviction callback.
+            prompt_cache->update();
             LLAMA_LOG_INFO("prompt cache save took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
         }
+
+        bool ram_cache_loaded = false;
         // has prompts saved earlier to load
         if (prompt_cache && !prompt_cache->states.empty()) {
             const int64_t t_start = ggml_time_us();
             copy_data_to_cached_prompt(tokens, *ret);
 
-            ret->prompt_load(*prompt_cache, task.tokens, cache_ram_similarity);
+            ram_cache_loaded = ret->prompt_load(*prompt_cache, task.tokens, cache_ram_similarity);
             prompt_cache->update();
 
-            ret->cache_tokens = ret->server_cached_prompt.tokens.clone(); // recover cache tokens
-            ret->n_discarded_prompt = ret->server_cached_prompt.n_discarded_prompt;
-            ret->n_kept_prompt = ret->server_cached_prompt.n_kept_prompt;
+            if (ram_cache_loaded) {
+                ret->cache_tokens = ret->server_cached_prompt.tokens.clone(); // recover cache tokens
+                ret->n_discarded_prompt = ret->server_cached_prompt.n_discarded_prompt;
+                ret->n_kept_prompt = ret->server_cached_prompt.n_kept_prompt;
+            }
 
             LLAMA_LOG_INFO("prompt cache load took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+        }
+
+        // RAM is authoritative. Consult disk only after no RAM snapshot was
+        // restored; a disk hit is then promoted into the live slot and the
+        // normal prompt path continues entirely in memory.
+        if (!ram_cache_loaded && disk_kv_cache && disk_kv_cache->enabled() &&
+            task.type == SERVER_TASK_TYPE_COMPLETION && !task.tokens.empty()) {
+            disk_kv_cache->load_best(*ret, task.tokens, cache_ram_similarity, mctx != nullptr);
         }
     }
     return ret;

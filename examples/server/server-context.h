@@ -5,7 +5,14 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
+#include <cstdint>
+#include <condition_variable>
+#include <deque>
+#include <filesystem>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 
 
@@ -116,7 +123,7 @@ struct server_slot {
 
     void prompt_save(server_prompt_cache& prompt_cache) const;
 
-    void prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, float min_reusable_fraction);
+    bool prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, float min_reusable_fraction);
 
     llama_pos checkpoint_pos = -1;
     bool do_checkpoint = false;
@@ -212,6 +219,78 @@ struct server_slot {
 
 };
 
+// Best-effort persistent second-level prefix cache used by llama-server.
+// The RAM prompt cache remains the primary cache. Only entries evicted from
+// RAM (or flushed during orderly shutdown) are handed to the background
+// writer; prompt/decode never performs disk I/O or a state snapshot for a
+// cache entry that is still hot in RAM.
+class server_disk_kv_cache {
+public:
+    server_disk_kv_cache(llama_context * ctx, const std::string & path, uint64_t max_bytes, const std::string & fingerprint);
+    ~server_disk_kv_cache();
+
+    bool enabled() const {
+        return enabled_;
+    }
+
+    bool load_best(server_slot & slot, const server_tokens & requested, float min_reusable_fraction, bool has_mtmd);
+    bool save_prompt(server_prompt prompt, bool wait_for_queue = false);
+
+private:
+    struct entry {
+        std::string stem;
+        std::filesystem::path state_path;
+        std::filesystem::path meta_path;
+        server_tokens tokens;
+        int32_t n_kept_prompt = 0;
+        int32_t n_discarded_prompt = 0;
+        uint64_t size_bytes = 0;
+        uint64_t last_used = 0;
+    };
+
+    struct pending_save {
+        entry value;
+        std::vector<uint8_t> state;
+    };
+
+    static constexpr uint32_t META_MAGIC = 0x3143564b; // "KVC1"
+    static constexpr uint32_t META_VERSION = 3;
+
+    llama_context * ctx_ = nullptr;
+    std::filesystem::path root_path_;
+    std::filesystem::path namespace_path_;
+    std::string fingerprint_;
+    uint64_t max_bytes_ = 0;
+    uint64_t used_bytes_ = 0;
+    bool enabled_ = false;
+    std::vector<entry> entries_;
+
+    std::mutex io_mutex_;
+    std::mutex fs_mutex_;
+    std::condition_variable io_cv_;
+    std::deque<pending_save> pending_saves_;
+    std::deque<entry> completed_saves_;
+    std::thread io_thread_;
+    bool io_stop_ = false;
+    static constexpr size_t MAX_PENDING_SAVES = 2;
+
+    static uint64_t now_ticks();
+    static bool has_media_tokens(const server_tokens & tokens);
+    static size_t common_prefix_tokens(const server_tokens & a, const server_tokens & b);
+
+    std::string stem_for_tokens(const server_tokens & tokens) const;
+    void scan();
+    bool read_metadata(const std::filesystem::path & path, entry & result) const;
+    bool write_metadata(const std::filesystem::path & path, const entry & value) const;
+    bool remove_entry_files(const entry & value);
+    void evict_if_needed(const std::string & keep_stem = "");
+    bool enforce_root_quota_locked();
+    void prune_missing_entries();
+    void writer_loop();
+    void write_pending_save(pending_save pending);
+    void drain_completed_saves();
+};
+
 struct server_metrics {
     int64_t t_start = 0;
 
@@ -271,6 +350,7 @@ struct server_context {
     server_response queue_results;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::unique_ptr<server_disk_kv_cache> disk_kv_cache;
 
     server_metrics metrics;
 
