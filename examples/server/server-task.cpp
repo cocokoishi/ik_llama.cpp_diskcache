@@ -1080,94 +1080,137 @@ size_t server_prompt_cache::n_tokens() const {
 
 }
 
-bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot, float min_reusable_fraction) {
-    thinking_tokens think_tokens;
+size_t server_cache_common_prefix(const server_tokens & a, const server_tokens & b) {
+    if (a.has_mtmd && b.has_mtmd) { return a.get_common_prefix_exact(b); }
+    size_t n = 0;
+    while (n < std::min(a.size(), b.size()) && a[n] == b[n] && a[n] != LLAMA_TOKEN_NULL) { ++n; }
+    return n;
+}
+
+size_t server_cache_prefix_boundary(const server_tokens & tokens, size_t count) {
+    count = std::min(count, tokens.size());
+    if (!tokens.has_mtmd) { return count; }
+    size_t index = 0;
+    while (index < count) {
+        const size_t next = tokens[index] == LLAMA_TOKEN_NULL
+            ? index + mtmd_input_chunk_get_n_tokens(tokens.find_chunk(index).get()) : index + 1;
+        if (next > count) { break; }
+        index = next;
+    }
+    return index;
+}
+
+bool server_cache_can_truncate(llama_context * ctx) {
+    const auto * model = llama_get_model(ctx);
+    return !llama_model_has_recurrent(model) && llama_model_supports_ctx_shift(model) &&
+        !llama_model_is_qwen4exp(model) && !llama_kv_cache_is_compacted(ctx);
+}
+
+server_cache_reuse server_cache_plan(llama_context * ctx, const server_tokens & tokens,
+        const server_tokens & requested, size_t evaluated) {
+    server_cache_reuse plan;
+    const size_t available = std::min(tokens.size(), evaluated);
+    // Sequence state does not carry sampling logits: an exact request still
+    // needs its final token evaluated. Include that rollback in the ranking.
+    plan.lcp = std::min(server_cache_common_prefix(tokens, requested), available);
+    if (!requested.empty()) { plan.lcp = std::min(plan.lcp, requested.size() - 1); }
+    plan.lcp = server_cache_prefix_boundary(tokens, plan.lcp);
+    if (plan.lcp == available || server_cache_can_truncate(ctx)) { plan.tokens = plan.lcp; }
+    return plan;
+}
+
+void server_cache_consider_checkpoint(server_cache_reuse & plan, const server_tokens & tokens,
+        int64_t n_tokens, llama_pos pos_max, size_t index) {
+    if (n_tokens > 0 && (size_t) n_tokens <= plan.lcp && (size_t) n_tokens > plan.tokens &&
+        pos_max == tokens.pos_next(n_tokens) - 1 &&
+        server_cache_prefix_boundary(tokens, n_tokens) == (size_t) n_tokens) {
+        plan.tokens = n_tokens;
+        plan.checkpoint = index;
+    }
+}
+
+server_cache_reuse server_prompt::reuse_plan(llama_context * ctx, const server_tokens & requested, size_t evaluated) const {
+    // Retained post-shift tokens alone cannot prove the discarded history.
+    if (n_discarded_prompt != 0 || llama_model_is_qwen4exp(llama_get_model(ctx)) ||
+        llama_model_is_deepseek4(llama_get_model(ctx))) { return {}; }
+    auto plan = server_cache_plan(ctx, tokens, requested, evaluated);
+    size_t index = 0;
+    for (const auto & checkpoint : checkpoints) {
+        if (!checkpoint.data.empty()) {
+            server_cache_consider_checkpoint(plan, tokens, checkpoint.n_tokens, checkpoint.pos_max, index);
+        }
+        ++index;
+    }
+    return plan;
+}
+
+bool server_cache_restore_checkpoint(llama_context * ctx, int32_t id, const server_prompt_checkpoint & checkpoint) {
+    const auto * model = llama_get_model(ctx);
+    if (llama_model_is_openpangu(model) && !llama_kv_cache_seq_rm(ctx, id, checkpoint.pos_max + 1, -1)) { return false; }
+    const auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+        (llama_model_is_recurrent(model) ? 0 : LLAMA_STATE_SEQ_FLAGS_KEEP_KV);
+    return !checkpoint.data.empty() &&
+        llama_state_seq_set_data(ctx, checkpoint.data.data(), checkpoint.data.size(), id, flags) == checkpoint.data.size() &&
+        llama_kv_cache_seq_pos_max(ctx, id) == checkpoint.pos_max;
+}
+
+size_t server_prompt_cache::best_reuse(const server_tokens & requested, size_t minimum) const {
+    for (const auto & state : states) {
+        if (!state.data.empty()) { minimum = std::max(minimum, state.reuse_plan(ctx, requested).tokens); }
+    }
+    return minimum;
+}
+
+bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& requested,
+        llama_context* ctx, int32_t id_slot, size_t minimum) {
+    auto best = states.end();
+    server_cache_reuse plan;
     for (auto it = states.begin(); it != states.end(); ++it) {
-        think_tokens = it->think_tokens;
-        break;
-    }
-    server_tokens prompt_tokens;
-    server_tokens tokens_new_ex;
-    if (think_tokens.exclude) {
-        prompt_tokens = prompt.tokens.get_tokens_exclude_think(ctx, think_tokens);
-        tokens_new_ex = tokens_new.get_tokens_exclude_think(ctx, think_tokens);
-    }
-    else {
-        prompt_tokens = prompt.tokens.clone();
-        tokens_new_ex = tokens_new.clone();
-    }
-    const auto lcp_best = prompt_tokens.get_common_prefix(ctx, tokens_new_ex);
-    float f_keep_best = float(lcp_best.second) / prompt_tokens.size();
-    float sim_best = prompt_tokens.get_tokens_similarity(ctx, tokens_new_ex, prompt.n_kept_prompt, prompt.n_discarded_prompt);
-    LLAMA_LOG_INFO(" - looking for better prompt, base f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n", f_keep_best, sim_best, prompt.n_kept_prompt, prompt.n_discarded_prompt);
-
-    auto it_best = states.end();
-
-    // find the most similar cached prompt, that would also preserve the most context
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        server_tokens tokens;
-        if (think_tokens.exclude) {
-            tokens = it->tokens.get_tokens_exclude_think(ctx, think_tokens);
-        }
-        else {
-            tokens = it->tokens.clone();
-        }
-        const auto lcp_cur = tokens.get_common_prefix(ctx, tokens_new_ex);
-        const float f_keep_cur = float(lcp_cur.first) / tokens.size();
-        if (f_keep_cur < min_reusable_fraction) {
-            continue;
-        }
-        const float sim_cur = tokens.get_tokens_similarity(ctx, tokens_new_ex, it->n_kept_prompt, it->n_discarded_prompt);
-        if (sim_best < sim_cur) {
-            f_keep_best = f_keep_cur;
-            sim_best = sim_cur;
-            it_best = it;
+        if (it->data.empty()) { continue; }
+        const auto candidate = it->reuse_plan(ctx, requested);
+        if (candidate.tokens > minimum) {
+            minimum = candidate.tokens;
+            plan = candidate;
+            best = it;
         }
     }
-
-    if (it_best != states.end()) {
-        LLAMA_LOG_INFO(" - found better prompt with f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n", f_keep_best, sim_best, it_best->n_kept_prompt, it_best->n_discarded_prompt);
-        const size_t size = it_best->data.size();
-        const size_t n = llama_state_seq_set_data(ctx, it_best->data.data(), size, id_slot, 0);
-        if (n != size) {
-            LLAMA_LOG_INFO("failed to restore state with size %zu\n", size);
-            llama_kv_cache_seq_rm(ctx, id_slot, -1, -1);
-            prompt = server_prompt{};
-            return false;
-        }
-
-        it_best->data.clear();
-        it_best->data.shrink_to_fit();
-
-        prompt = std::move(*it_best);
-
-        states.erase(it_best);
-        return true;
+    if (best == states.end()) { return false; }
+    bool valid = llama_state_seq_set_data(ctx, best->data.data(), best->data.size(), id_slot, 0) == best->data.size();
+    valid = valid && llama_kv_cache_seq_pos_max(ctx, id_slot) == best->tokens.pos_next() - 1;
+    if (valid && plan.checkpoint != SIZE_MAX) {
+        auto checkpoint = best->checkpoints.begin();
+        std::advance(checkpoint, plan.checkpoint);
+        valid = server_cache_restore_checkpoint(ctx, id_slot, *checkpoint);
+    } else if (valid && plan.tokens < best->tokens.size()) {
+        valid = llama_kv_cache_seq_rm(ctx, id_slot, best->tokens.pos_next(plan.tokens), -1);
     }
-
-    return false;
+    valid = valid && llama_kv_cache_seq_pos_max(ctx, id_slot) == best->tokens.pos_next(plan.tokens) - 1;
+    if (!valid) {
+        llama_kv_cache_seq_rm(ctx, id_slot, -1, -1);
+        prompt = server_prompt{};
+        states.erase(best);
+        return false;
+    }
+    best->data.clear();
+    best->data.shrink_to_fit();
+    best->state_boundaries.clear();
+    best->tokens.keep_first(plan.tokens);
+    best->checkpoints.remove_if([&](const server_prompt_checkpoint & checkpoint) { return checkpoint.n_tokens > (int64_t) plan.tokens; });
+    prompt = std::move(*best);
+    states.erase(best);
+    return true;
 }
 
 server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t state_size) {
     for (auto it = states.begin(); it != states.end();) {
-        auto tokens_ctx_shift = prompt.tokens.clone();  // copy cache tokens
-        tokens_ctx_shift.discard_n_tokens(prompt.n_kept_prompt, prompt.n_discarded_prompt);
-        auto prefix = it->tokens.get_common_prefix(ctx, tokens_ctx_shift);
-        const size_t len = prefix.first;
-        const size_t len_prompt = prefix.second;
-        // first check if the current state is contained fully in the cache
-        if (len_prompt == tokens_ctx_shift.size()) {
-            LLAMA_LOG_INFO("%s", " - prompt is already in the cache, skipping\n");
-            return nullptr;
-        }
-        // next, remove any cached prompts that are fully contained in the current prompt
-        else if (len == it->tokens.size()) {
-            LLAMA_LOG_INFO(" - removing obsolete cached prompt with length %d\n", (int)len);
-            it = states.erase(it);
-        }
-        else {
-            ++it;
-        }
+        if (prompt.n_discarded_prompt || it->n_discarded_prompt) { ++it; continue; }
+        const size_t lcp = server_cache_common_prefix(it->tokens, prompt.tokens);
+        const bool exact = lcp == prompt.tokens.size() && lcp == it->tokens.size();
+        // A longer recurrent state cannot replace a shorter safe full-prefix
+        // snapshot. Only ordinary rewindable KV admits containment elimination.
+        if (exact || (server_cache_can_truncate(ctx) && lcp == prompt.tokens.size())) { return nullptr; }
+        if (server_cache_can_truncate(ctx) && lcp == it->tokens.size()) { it = states.erase(it); }
+        else { ++it; }
     }
 
     std::vector<uint8_t> state_data;
@@ -1205,19 +1248,12 @@ server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t st
 
 void server_prompt_cache::update() {
     if (limit_size > 0) {
-        // With a disk second-level cache, a single oversized RAM entry must
-        // also be spillable.  Without a successful callback, keep it in RAM
-        // rather than silently dropping the only recoverable copy.
-        while (!states.empty() && size() > limit_size && (states.size() > 1 || on_evict)) {
+        // RAM eviction is memory accounting only. Persistence is scheduled
+        // from resident slots, independently of this cache's size or lifetime.
+        while (!states.empty() && size() > limit_size) {
 
             LLAMA_LOG_INFO(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
-            if (on_evict) {
-                if (!on_evict(std::move(states.front()))) {
-                    LLAMA_LOG_WARN(" - disk cache spill failed; retaining oldest RAM prompt\n");
-                    break;
-                }
-            }
             states.pop_front();
         }
     }

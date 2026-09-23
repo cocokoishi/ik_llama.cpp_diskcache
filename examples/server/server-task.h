@@ -385,16 +385,33 @@ struct server_prompt_checkpoint {
 };
 
 
+// All cache tiers rank evaluated, safely restorable token prefixes, never similarity.
+struct server_cache_reuse {
+    size_t lcp = 0;
+    size_t tokens = 0;
+    size_t checkpoint = SIZE_MAX;
+};
+size_t server_cache_common_prefix(const server_tokens & a, const server_tokens & b);
+size_t server_cache_prefix_boundary(const server_tokens & tokens, size_t count);
+bool server_cache_can_truncate(llama_context * ctx);
+server_cache_reuse server_cache_plan(llama_context * ctx, const server_tokens & tokens,
+    const server_tokens & requested, size_t evaluated = SIZE_MAX);
+void server_cache_consider_checkpoint(server_cache_reuse & plan, const server_tokens & tokens,
+    int64_t n_tokens, llama_pos pos_max, size_t index);
+bool server_cache_restore_checkpoint(llama_context * ctx, int32_t id, const server_prompt_checkpoint & checkpoint);
+
 struct server_prompt {
     server_tokens tokens;
-    int n_kept_prompt;
-    int n_discarded_prompt;
+    int n_kept_prompt = 0;
+    int n_discarded_prompt = 0;
     thinking_tokens think_tokens;
 
     std::vector<uint8_t> data;
 
     std::list<server_prompt_checkpoint> checkpoints;
     std::vector<size_t> state_boundaries;
+
+    server_cache_reuse reuse_plan(llama_context * ctx, const server_tokens & requested, size_t evaluated = SIZE_MAX) const;
 
     size_t size() const;
 
@@ -445,18 +462,14 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
     llama_context* ctx;
-    std::function<bool(server_prompt &&)> on_evict;
     size_t size() const;
 
     size_t n_tokens() const;
 
     server_prompt* alloc(const server_prompt& prompt, size_t state_size);
 
-    bool load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot, float min_reusable_fraction);
-
-    void set_evict_callback(std::function<bool(server_prompt &&)> callback) {
-        on_evict = std::move(callback);
-    }
+    size_t best_reuse(const server_tokens & requested, size_t minimum) const;
+    bool load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot, size_t minimum);
 
     void update();
 };

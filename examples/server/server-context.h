@@ -71,6 +71,7 @@ struct server_slot {
     // when a task is submitted, we first tokenize the prompt and store it here
     server_tokens prompt_tokens;
     server_tokens cache_tokens;
+    server_tokens cache_origin; // pre-shift request identity for resident-only reuse
 
     int32_t last_gentxt_size = 0;
     std::string generated_text;
@@ -124,8 +125,17 @@ struct server_slot {
 
     void prompt_save(server_prompt_cache& prompt_cache) const;
 
-    bool prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, float min_reusable_fraction);
+    bool prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, size_t minimum);
 
+    // Resident-lifetime persistence schedule; reset() only resets request data.
+    server_tokens disk_stable_prefix;
+    size_t disk_checkpoint_target = 0;
+    size_t disk_continued_position = 0;
+    server_tokens disk_continued_prefix;
+
+    size_t evaluated_tokens() const;
+    server_cache_reuse reuse_plan(const server_tokens & requested) const;
+    size_t restorable_tokens(const server_tokens & requested) const;
     llama_pos checkpoint_pos = -1;
     bool do_checkpoint = false;
     bool image_just_processed = false;
@@ -234,7 +244,9 @@ public:
         return enabled_;
     }
 
-    bool load_best(server_slot & slot, const server_tokens & requested, float min_reusable_fraction, bool has_mtmd);
+    size_t load_best(server_slot & slot, const server_tokens & requested, size_t minimum, bool has_mtmd, bool restore = true);
+    bool contains(const server_tokens & tokens);
+    bool can_save();
     bool save_prompt(server_prompt && prompt, bool wait_for_queue = false);
 
 private:
@@ -551,6 +563,10 @@ struct server_context {
     // Re-aggregates all active vectors and updates the model state
     bool apply_control_vectors_internal();
 
+    void prepare_slot_cache(server_slot & slot, const server_task & task);
+    bool persist_slot(server_slot & slot, const char * reason, size_t tokens = 0, bool wait = false);
+    void maintain_disk_cache();
+    size_t disk_next_boundary(const server_slot & slot) const;
     bool create_checkpoint(server_slot & slot);
 
     void apply_checkpoint(server_slot & slot);

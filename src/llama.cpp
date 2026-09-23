@@ -10844,7 +10844,7 @@ struct llama_data_write {
         }
     }
 
-    void write_kv_cache(const struct llama_context * ctx, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) {
+    void write_kv_cache(const struct llama_context * ctx, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos p_end = -1) {
         const struct llama_kv_cache & kv_self = ctx->kv_self;
 
         if (llama_kv_has_openpangu_partial_state(kv_self, ctx->model.arch, flags)) {
@@ -10862,7 +10862,8 @@ struct llama_data_write {
         uint32_t cell_range_begin = kv_self.size;
         for (uint32_t i = 0; i < kv_self.size; ++i) {
             const auto & cell = kv_self.cells[i];
-            if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {
+            if (((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) &&
+                (p_end < 0 || cell.pos < p_end)) {
                 ++cell_count;
                 if (cell_range_begin == kv_self.size) {
                     cell_range_begin = i;
@@ -12258,6 +12259,46 @@ size_t llama_state_seq_get_data_ext(struct llama_context * ctx, uint8_t * dst, s
         return llama_state_seq_get_data_internal(ctx, data_ctx, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving sequence state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+static size_t llama_state_seq_get_prefix_internal(llama_context * ctx, llama_data_write & writer,
+        llama_seq_id seq_id, llama_pos p_end) {
+    if (seq_id < 0 || (uint32_t) seq_id >= llama_n_seq_max(ctx) || p_end <= 0 ||
+        !llama_state_io_supported(ctx, __func__, 0, seq_id)) { return 0; }
+    llama_synchronize(ctx);
+    const llama_pos end = llama_kv_cache_seq_pos_max(ctx, seq_id) + 1;
+    if (p_end > end) { return 0; }
+    if (p_end < end && (llama_model_has_recurrent(&ctx->model) ||
+        !llama_model_supports_ctx_shift(&ctx->model) || llama_model_is_qwen4exp(&ctx->model) ||
+        ctx->kv_self.any_compacted() || llama_kv_has_qnext_state_storage(ctx->kv_self))) { return 0; }
+    if (p_end < end && llama_kv_cache_seq_pos_min(ctx, seq_id) >
+        std::max(0, p_end - llama_kv_cache_n_swa(ctx))) { return 0; }
+    const auto & cells = ctx->kv_self.cells;
+    if (std::none_of(cells.begin(), cells.end(), [&](const llama_kv_cell & cell) {
+            return cell.has_seq_id(seq_id) && cell.pos == p_end - 1;
+        })) { return 0; }
+    // Filtering cell ranges preserves tensor layout (including transposed V),
+    // stream boundaries and sequence metadata without altering resident KV.
+    writer.write_kv_cache(ctx, seq_id, 0, p_end);
+    return writer.get_size_written();
+}
+
+size_t llama_state_seq_get_prefix_size(llama_context * ctx, llama_seq_id seq_id, llama_pos p_end) {
+    llama_data_write_dummy writer;
+    return llama_state_seq_get_prefix_internal(ctx, writer, seq_id, p_end);
+}
+
+size_t llama_state_seq_get_prefix_data(llama_context * ctx, uint8_t * dst, size_t size,
+        llama_seq_id seq_id, llama_pos p_end, void (*boundary)(size_t, void *), void * user_data) {
+    llama_data_write_buffer writer(dst, size, ctx->model);
+    writer.boundary = boundary;
+    writer.boundary_data = user_data;
+    try {
+        return llama_state_seq_get_prefix_internal(ctx, writer, seq_id, p_end);
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: prefix snapshot failed: %s\n", __func__, error.what());
         return 0;
     }
 }

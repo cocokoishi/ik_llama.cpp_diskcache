@@ -1052,6 +1052,15 @@ extern "C" {
             llama_seq_id seq_id, llama_state_seq_flags flags,
             void (*boundary)(size_t offset, void * user_data), void * user_data);
 
+    // Non-mutating prefix snapshot. p_end is an exclusive KV position, not a
+    // token count. Historical prefixes are accepted only for rewindable KV;
+    // private/recurrent state must already be at the requested boundary.
+    LLAMA_API size_t llama_state_seq_get_prefix_size(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p_end);
+    LLAMA_API size_t llama_state_seq_get_prefix_data(
+            struct llama_context * ctx, uint8_t * dst, size_t size,
+            llama_seq_id seq_id, llama_pos p_end,
+            void (*boundary)(size_t offset, void * user_data), void * user_data);
+
     // Copy the sequence data (originally copied with `llama_state_seq_get_data`) into the specified sequence
     // Returns:
     //  - Positive: Ok

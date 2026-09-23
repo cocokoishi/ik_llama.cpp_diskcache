@@ -1,3 +1,20 @@
+> ## **TL;DR — Experimental Persistent Disk KV Cache Fork**
+>
+> Experimental **ik_llama.cpp** fork adding persistent disk KV caching for local Agent workloads, with shared-prefix deduplication and cache reuse across requests and `llama-server` restarts.
+>
+> ```bat
+> --disk-kvcache "<cache_path>" 10g
+> ```
+>
+> I only guarantee it on **pure CPU inference**, since that's what I actually test. **CUDA should theoretically work just as well**, but is currently unverified.
+>
+> On my **Ryzen 7 5800H + 64 GB dual-channel DDR4-3200**, running **Qwen3.6-35B-A3B Q4_K_M + Q8 KV**, I get **at least ~60 tok/s prefill and ~10 tok/s decode even at 131072 context**, with typical speeds reaching roughly **60–100 tok/s prefill and 10–16 tok/s decode**.
+>
+> Main use case: making local Agents actually usable for **ComfyUI prompt generation and fully automated image workflows**. Still experimental; the latest cache changes have not been fully benchmarked yet.
+
+
+---
+
 # ik_llama.cpp: llama.cpp fork with better CPU performance
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
